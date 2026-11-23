@@ -14,6 +14,11 @@ while [ $# -gt 0 ]; do
     *) echo "Unknown option $1. Usage: ms/runner/install.sh --p12 PATH" >&2; exit 2 ;;
   esac
 done
+# Before anything changes this Mac: a wrong path most likely means the wrong Mac.
+if [ -n "$P12" ] && [ ! -f "$P12" ]; then
+  echo "No file $P12. Export the Developer ID Application certificate as a .p12 first (see ms/runner/README.md), on the signing Mac." >&2
+  exit 1
+fi
 
 VERSION=2.338.2
 case "$(uname -m)" in
@@ -78,7 +83,6 @@ sudo -u "$CI_USER" -H bash -c '
 
 if ! sudo test -f "$KEYCHAIN"; then
   [ -n "$P12" ] || { echo "No signing keychain yet: pass --p12 with the Developer ID Application certificate." >&2; exit 1; }
-  [ -f "$P12" ] || { echo "No file $P12." >&2; exit 1; }
   read -r -s -p "Password of $P12: " P12_PASSWORD
   echo
   KEYCHAIN_PASSWORD=$(openssl rand -base64 24)
