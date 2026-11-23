@@ -33,6 +33,10 @@ esac
 [ "$REVISION" -ge 1 ] || { echo "ms/build.sh: --revision must be a whole number from 1, not $REVISION" >&2; exit 2; }
 [ -n "$OUT" ] || { echo "ms/build.sh: --out is required" >&2; exit 2; }
 
+case "$OUT" in /*) ;; *) OUT="$PWD/$OUT" ;; esac
+# rustup picks the toolchain from the working directory: rust-toolchain.toml.
+cd "$ROOT"
+
 case "$(uname -s)" in
   Darwin) ;;
   *) echo "ms/build.sh: this builds on macOS only ($(uname -s))" >&2; exit 1 ;;

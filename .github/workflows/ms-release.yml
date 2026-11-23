@@ -62,6 +62,13 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "Publishing herdr $base-ms.$revision from $BRANCH at $(git rev-parse --short HEAD)"
 
+      - name: Rust toolchain and targets
+        run: |
+          set -euo pipefail
+          # From the checkout, so these land on the toolchain rust-toolchain.toml pins.
+          rustup toolchain install
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
       - name: Build
         run: |
           set -euo pipefail
