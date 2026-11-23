@@ -79,6 +79,18 @@ else
   if jq -e --arg v "$VERSION" 'any(.builds[]; .version == $v)' <<<"$PREVIOUS_JSON" >/dev/null; then
     fail "$VERSION is already in $PREVIOUS"
   fi
+  # Installers take the list's newest across herdr versions, so a build must be
+  # newer than every build already published.
+  NEWEST="$(jq -r '.newest // empty' <<<"$PREVIOUS_JSON")"
+  if [ -n "$NEWEST" ]; then
+    NEWEST_BASE="${NEWEST%-ms.*}"
+    NEWEST_REVISION="${NEWEST##*-ms.}"
+    if [ "$NEWEST_BASE" = "$BASE" ]; then
+      [ "$REVISION" -gt "$NEWEST_REVISION" ] || fail "$VERSION is not newer than the list's newest, $NEWEST"
+    elif [ "$(printf '%s\n%s\n' "$BASE" "$NEWEST_BASE" | sort -V | tail -1)" != "$BASE" ]; then
+      fail "$VERSION is older than the list's newest, $NEWEST"
+    fi
+  fi
 fi
 
 mkdir -p "$OUT"

@@ -10,7 +10,6 @@ on:
         description: "Branch to build, mattstack/<upstream version>"
         required: true
         type: string
-        default: mattstack/0.9.5
 
 permissions:
   contents: write
@@ -50,6 +49,10 @@ jobs:
           last="$(printf '%s\n' "$tags" | sed -n "s/^v${base//./\\.}-ms\.\([0-9][0-9]*\)$/\1/p" | sort -n | tail -1)"
           revision=$(( ${last:-0} + 1 ))
           newest_base="$(printf '%s\n' "$tags" | sed -n 's/^v\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)-ms\.[0-9][0-9]*$/\1/p' | sort -V | tail -1)"
+          if [ -n "$newest_base" ] && [ "$(printf '%s\n%s\n' "$base" "$newest_base" | sort -V | tail -1)" != "$base" ]; then
+            echo "::error::herdr $newest_base is already published; a $base build would move everyone back. Build mattstack/$newest_base or newer."
+            exit 1
+          fi
           {
             echo "base=$base"
             echo "revision=$revision"

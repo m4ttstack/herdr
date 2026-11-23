@@ -62,6 +62,16 @@ check "latest.json: no herdr.dev URL" '[.. | strings | select(test("herdr\\.dev"
 check "a build never supersedes its own bytes" \
   ".builds[2].supersedes | sort == ([\"$ARM2_SHA\", \"$X862_SHA\"] | sort)" "$WORK/three/herdr-builds.json"
 
+"$ROOT/ms/manifests.sh" --version 0.9.6-ms.1 --base 0.9.6 --revision 1 \
+  --arm64 "$WORK/arm64-2" --x86_64 "$WORK/x86_64-2" \
+  --previous "$WORK/three/herdr-builds.json" --notes "$FIX/notes.md" --out "$WORK/newer" >/dev/null
+check "a newer base after revisions is the newest" '.newest == "0.9.6-ms.1"' "$WORK/newer/herdr-builds.json"
+if "$ROOT/ms/manifests.sh" --version 0.9.5-ms.4 --base 0.9.5 --revision 4 \
+  --arm64 "$FIX/herdr-macos-aarch64" --x86_64 "$FIX/herdr-macos-x86_64" \
+  --previous "$WORK/newer/herdr-builds.json" --notes "$FIX/notes.md" --out "$WORK/older" 2>/dev/null; then
+  echo "FAIL refuses a build older than the list's newest" >&2; FAILS=$((FAILS + 1))
+else echo "ok   refuses a build older than the list's newest"; fi
+
 if "$ROOT/ms/manifests.sh" --version 0.9.5-ms.2 --base 0.9.5 --revision 2 \
   --arm64 "$FIX/herdr-macos-aarch64" --x86_64 "$FIX/herdr-macos-x86_64" \
   --previous "$B2" --notes "$FIX/notes.md" --out "$WORK/dup" 2>/dev/null; then
