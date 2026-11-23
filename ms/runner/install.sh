@@ -113,7 +113,9 @@ if ! sudo test -f "$KEYCHAIN"; then
   # No auto-lock: a release job unlocks it with the password file.
   sudo -u "$CI_USER" -H security set-keychain-settings "$KEYCHAIN"
   sudo -u "$CI_USER" -H security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
-  sudo -u "$CI_USER" -H security import "$P12_COPY" -k "$KEYCHAIN" -P "$P12_PASSWORD" -T /usr/bin/codesign
+  # -x: the private key can never be exported from this keychain, even by a
+  # job that knows the keychain password.
+  sudo -u "$CI_USER" -H security import "$P12_COPY" -k "$KEYCHAIN" -P "$P12_PASSWORD" -x -T /usr/bin/codesign
   # Lets codesign use the key without a GUI prompt, which a launchd job cannot answer.
   sudo -u "$CI_USER" -H security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
 fi
