@@ -20,7 +20,7 @@ concurrency:
 
 jobs:
   release:
-    runs-on: [self-hosted, herdr-signer]
+    runs-on: herdr-signer
     timeout-minutes: 90
     env:
       GH_TOKEN: ${{ github.token }}

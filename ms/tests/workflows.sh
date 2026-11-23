@@ -32,4 +32,18 @@ ruby -ryaml -e '
     fails.each { |f| warn "FAIL #{f}" }
     exit 1
   end
-' "$ROOT/.github/workflows/ms-upstream.yml"
+' "$ROOT/.github/workflows/ms-upstream.yml" || exit 1
+
+# The runner registers with --no-default-labels, so the release job may ask
+# only for labels install.sh gives it, or it queues forever.
+ruby -ryaml -e '
+  wanted = Array(YAML.load_file(ARGV[0]).dig("jobs", "release", "runs-on"))
+  given = File.read(ARGV[1])[/--labels (\S+)/, 1].to_s.split(",")
+  missing = wanted - given
+  if missing.empty?
+    puts "PASS: the release job asks only for labels the runner has"
+  else
+    warn "FAIL the release job asks for #{missing.join(", ")}, which install.sh never registers"
+    exit 1
+  end
+' "$ROOT/.github/workflows/ms-release.yml" "$ROOT/ms/runner/install.sh" || exit 1
