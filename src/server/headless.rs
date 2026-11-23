@@ -188,6 +188,13 @@ enum AltScreenReadConflict {
     Defer,
 }
 
+#[derive(Clone, Copy)]
+struct TerminalAttachHostTheme {
+    theme: crate::terminal_theme::TerminalTheme,
+    appearance: Option<crate::terminal_theme::HostAppearance>,
+    appearance_explicit: bool,
+}
+
 /// The headless server — runs the herdr event loop without a real terminal.
 pub struct HeadlessServer {
     app: app::App,
@@ -208,6 +215,9 @@ pub struct HeadlessServer {
     next_client_id: u64,
     /// The client currently driving session-wide host presentation and side effects.
     foreground_client_id: Option<u64>,
+    /// The host theme a terminal controller last set, put back whenever no
+    /// foreground client is left to own the session's theme.
+    terminal_attach_host_theme: Option<TerminalAttachHostTheme>,
     /// Ephemeral shell connection controlling PTY geometry for each stable tab id.
     tab_geometry_controllers: HashMap<String, u64>,
     /// Stable tab id whose viewers may see and interact with the one terminal popup.
@@ -364,6 +374,7 @@ impl HeadlessServer {
             #[cfg(unix)]
             next_client_id: 1,
             foreground_client_id: None,
+            terminal_attach_host_theme: None,
             tab_geometry_controllers: HashMap::new(),
             popup_owner_tab_id: None,
             client_shell_boot_id: format!(
@@ -809,6 +820,7 @@ impl HeadlessServer {
             let server_keybindings = self.server_keybindings.clone();
             apply_keybindings(&mut self.app, &server_keybindings);
             self.sync_visible_server_config_diagnostic(false);
+            self.restore_terminal_attach_host_theme();
             return;
         };
         let Some(client) = self.clients.get(&client_id) else {
@@ -820,6 +832,7 @@ impl HeadlessServer {
             let server_keybindings = self.server_keybindings.clone();
             apply_keybindings(&mut self.app, &server_keybindings);
             self.sync_visible_server_config_diagnostic(false);
+            self.restore_terminal_attach_host_theme();
             return;
         };
 
@@ -850,6 +863,22 @@ impl HeadlessServer {
             host_terminal_appearance_explicit,
         );
         self.app.set_host_terminal_theme(host_terminal_theme);
+    }
+
+    /// A foreground client's theme is the session's only while it is
+    /// foreground; once none is left, the terminal controller's comes back.
+    fn restore_terminal_attach_host_theme(&mut self) {
+        if let Some(applied) = self.terminal_attach_host_theme {
+            self.apply_terminal_attach_host_theme(applied);
+        }
+    }
+
+    fn apply_terminal_attach_host_theme(&mut self, applied: TerminalAttachHostTheme) -> bool {
+        let mut changed = self
+            .app
+            .set_host_terminal_appearance_state(applied.appearance, applied.appearance_explicit);
+        changed |= self.app.set_host_terminal_theme(applied.theme);
+        changed
     }
 
     fn sync_visible_server_config_diagnostic(&mut self, uses_local_keybindings: bool) {
@@ -2261,6 +2290,26 @@ impl HeadlessServer {
                 let Some(client) = self.clients.get_mut(&client_id) else {
                     return false;
                 };
+                // A terminal controller has no shell surface to be foreground in;
+                // its theme applies to every pane as soon as it arrives.
+                // A theme line arrives as several updates, so each one merges onto
+                // the session's current theme rather than the client's own, which
+                // starts empty and would clear every pane's colors until the rest
+                // arrived.
+                if matches!(client.mode, ClientConnectionMode::TerminalAttach { .. }) {
+                    client.host_terminal_theme = self.app.state.host_terminal_theme;
+                    client.host_terminal_appearance = self.app.state.host_terminal_appearance;
+                    client.host_terminal_appearance_explicit =
+                        self.app.state.host_terminal_appearance_explicit;
+                    client.update_host_theme(&update);
+                    let applied = TerminalAttachHostTheme {
+                        theme: client.host_terminal_theme,
+                        appearance: client.host_terminal_appearance,
+                        appearance_explicit: client.host_terminal_appearance_explicit,
+                    };
+                    self.terminal_attach_host_theme = Some(applied);
+                    return self.apply_terminal_attach_host_theme(applied);
+                }
                 if !matches!(client.mode, ClientConnectionMode::ClientShell) {
                     return false;
                 }

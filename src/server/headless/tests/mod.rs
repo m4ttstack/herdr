@@ -114,6 +114,7 @@ fn test_headless_server_with_event_hub(event_hub: api::EventHub) -> HeadlessServ
         #[cfg(unix)]
         next_client_id: 1,
         foreground_client_id: None,
+        terminal_attach_host_theme: None,
         tab_geometry_controllers: HashMap::new(),
         popup_owner_tab_id: None,
         client_shell_boot_id: "test-boot".into(),
@@ -8332,4 +8333,158 @@ fn no_handle_internal_event_bypass_in_module() {
              handle_internal_event_with_forwarding (bypass risk):\n  {}",
         bypass_lines.join("\n  ")
     );
+}
+
+#[test]
+fn terminal_attach_host_theme_applies_without_a_foreground_shell() {
+    let mut server = test_headless_server();
+    let mut client = ClientConnection::new(
+        (80, 24),
+        crate::kitty_graphics::HostCellSize::default(),
+        1,
+        RenderEncoding::SemanticFrame,
+        None,
+    );
+    client.mode = ClientConnectionMode::TerminalAttach {
+        terminal_id: "1".to_owned(),
+    };
+    server.clients.insert(1, client);
+    server.foreground_client_id = None;
+
+    let light = protocol::ClientHostColor {
+        r: 240,
+        g: 230,
+        b: 220,
+    };
+    server.handle_server_event(ServerEvent::ClientShellHostTheme {
+        client_id: 1,
+        update: protocol::ClientHostThemeUpdate::Appearance(protocol::ClientHostAppearance::Light),
+    });
+    assert!(
+        server.handle_server_event(ServerEvent::ClientShellHostTheme {
+            client_id: 1,
+            update: protocol::ClientHostThemeUpdate::DefaultColor {
+                kind: protocol::ClientHostDefaultColorKind::Background,
+                color: light,
+            },
+        })
+    );
+    assert_eq!(
+        server.app.state.host_terminal_theme.background,
+        Some(light.into())
+    );
+    assert_eq!(
+        server.app.state.host_terminal_appearance,
+        Some(crate::terminal_theme::HostAppearance::Light)
+    );
+    assert!(server.app.state.host_terminal_appearance_explicit);
+}
+
+fn terminal_attach_test_client() -> ClientConnection {
+    let mut client = ClientConnection::new(
+        (80, 24),
+        crate::kitty_graphics::HostCellSize::default(),
+        1,
+        RenderEncoding::SemanticFrame,
+        None,
+    );
+    client.mode = ClientConnectionMode::TerminalAttach {
+        terminal_id: "1".to_owned(),
+    };
+    client
+}
+
+#[test]
+fn terminal_attach_host_theme_merges_onto_the_current_theme() {
+    let mut server = test_headless_server();
+    let mut current = crate::terminal_theme::TerminalTheme::default();
+    current.foreground = Some(
+        protocol::ClientHostColor {
+            r: 205,
+            g: 214,
+            b: 244,
+        }
+        .into(),
+    );
+    current.background = Some(
+        protocol::ClientHostColor {
+            r: 30,
+            g: 30,
+            b: 46,
+        }
+        .into(),
+    );
+    current.palette[1] = current.foreground;
+    server.app.set_host_terminal_theme(current);
+    server.clients.insert(1, terminal_attach_test_client());
+    server.foreground_client_id = None;
+
+    server.handle_server_event(ServerEvent::ClientShellHostTheme {
+        client_id: 1,
+        update: protocol::ClientHostThemeUpdate::Appearance(protocol::ClientHostAppearance::Light),
+    });
+
+    assert_eq!(server.app.state.host_terminal_theme, current);
+    assert_eq!(
+        server.app.state.host_terminal_appearance,
+        Some(crate::terminal_theme::HostAppearance::Light)
+    );
+}
+
+#[test]
+fn terminal_attach_host_theme_returns_when_the_foreground_client_leaves() {
+    let mut server = test_headless_server();
+    server.clients.insert(1, terminal_attach_test_client());
+    server.foreground_client_id = None;
+    let light = protocol::ClientHostColor {
+        r: 239,
+        g: 241,
+        b: 245,
+    };
+    server.handle_server_event(ServerEvent::ClientShellHostTheme {
+        client_id: 1,
+        update: protocol::ClientHostThemeUpdate::Appearance(protocol::ClientHostAppearance::Light),
+    });
+    server.handle_server_event(ServerEvent::ClientShellHostTheme {
+        client_id: 1,
+        update: protocol::ClientHostThemeUpdate::DefaultColor {
+            kind: protocol::ClientHostDefaultColorKind::Background,
+            color: light,
+        },
+    });
+    let controller_theme = server.app.state.host_terminal_theme;
+
+    let mut shell = ClientConnection::new(
+        (80, 24),
+        crate::kitty_graphics::HostCellSize::default(),
+        2,
+        RenderEncoding::SemanticFrame,
+        None,
+    );
+    shell.mode = ClientConnectionMode::ClientShell;
+    shell.host_terminal_theme.background = Some(
+        protocol::ClientHostColor {
+            r: 30,
+            g: 30,
+            b: 46,
+        }
+        .into(),
+    );
+    shell.host_terminal_appearance = Some(crate::terminal_theme::HostAppearance::Dark);
+    let shell_theme = shell.host_terminal_theme;
+    server.clients.insert(2, shell);
+    server.foreground_client_id = Some(2);
+    server.sync_foreground_client_state();
+    assert_eq!(server.app.state.host_terminal_theme, shell_theme);
+
+    server.clients.remove(&2);
+    server.foreground_client_id = None;
+    server.sync_foreground_client_state();
+
+    assert_eq!(server.app.state.host_terminal_theme, controller_theme);
+    assert_eq!(
+        server.app.state.host_terminal_appearance,
+        Some(crate::terminal_theme::HostAppearance::Light)
+    );
+    assert!(server.app.state.host_terminal_appearance_explicit);
 }

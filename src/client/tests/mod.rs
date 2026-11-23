@@ -961,3 +961,57 @@ fn terminal_control_scroll_command_maps_to_attach_scroll() {
     assert_eq!(direction, AttachScrollDirection::Up);
     assert_eq!(lines, 3);
 }
+
+#[test]
+fn terminal_control_host_theme_maps_to_appearance_then_default_colors() {
+    let messages = terminal_control_messages_from_json(
+        r##"{"type":"terminal.host_theme","fg":"#1e1e2e","bg":"#EFF1F5","appearance":"light"}"##,
+    )
+    .unwrap();
+    let updates: Vec<_> = messages
+        .into_iter()
+        .map(|message| match message {
+            ClientMessage::ClientShellHostTheme { update } => update,
+            _ => panic!("expected host theme update"),
+        })
+        .collect();
+    assert_eq!(
+        updates,
+        vec![
+            crate::protocol::ClientHostThemeUpdate::Appearance(
+                crate::protocol::ClientHostAppearance::Light
+            ),
+            crate::protocol::ClientHostThemeUpdate::DefaultColor {
+                kind: crate::protocol::ClientHostDefaultColorKind::Background,
+                color: crate::protocol::ClientHostColor {
+                    r: 0xef,
+                    g: 0xf1,
+                    b: 0xf5
+                },
+            },
+            crate::protocol::ClientHostThemeUpdate::DefaultColor {
+                kind: crate::protocol::ClientHostDefaultColorKind::Foreground,
+                color: crate::protocol::ClientHostColor {
+                    r: 0x1e,
+                    g: 0x1e,
+                    b: 0x2e
+                },
+            },
+        ]
+    );
+}
+
+#[test]
+fn terminal_control_host_theme_rejects_bad_colors_and_empty_updates() {
+    assert!(terminal_control_messages_from_json(
+        r##"{"type":"terminal.host_theme","bg":"#12345"}"##
+    )
+    .is_err());
+    assert!(terminal_control_messages_from_json(r#"{"type":"terminal.host_theme"}"#).is_err());
+    assert!(matches!(
+        terminal_control_messages_from_json(r#"{"type":"terminal.release"}"#)
+            .unwrap()
+            .as_slice(),
+        [ClientMessage::Detach]
+    ));
+}

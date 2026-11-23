@@ -7,7 +7,8 @@ use tracing::info;
 
 use crate::ipc::LocalStream;
 use crate::protocol::{
-    self, AttachScrollDirection, AttachScrollSource, ClientMessage, ClientMouseButton,
+    self, AttachScrollDirection, AttachScrollSource, ClientHostAppearance, ClientHostColor,
+    ClientHostDefaultColorKind, ClientHostThemeUpdate, ClientMessage, ClientMouseButton,
     ClientMouseKind, ClientMousePosition, RenderEncoding, ServerMessage, MAX_GRAPHICS_FRAME_SIZE,
 };
 use crate::server::socket_paths::client_socket_path;
@@ -50,14 +51,16 @@ pub fn run_terminal_session_control(
             if line.trim().is_empty() {
                 continue;
             }
-            match terminal_control_command_from_json(&line) {
-                Ok(message) => {
-                    let release = matches!(message, ClientMessage::Detach);
-                    if write_to_server(&mut write_stream, &message).is_err() {
-                        return;
-                    }
-                    if release {
-                        return;
+            match terminal_control_messages_from_json(&line) {
+                Ok(messages) => {
+                    for message in messages {
+                        let release = matches!(message, ClientMessage::Detach);
+                        if write_to_server(&mut write_stream, &message).is_err() {
+                            return;
+                        }
+                        if release {
+                            return;
+                        }
                     }
                 }
                 Err(err) => eprintln!("herdr: terminal session control input ignored: {err}"),
@@ -66,7 +69,22 @@ pub fn run_terminal_session_control(
         let _ = write_to_server(&mut write_stream, &ClientMessage::Detach);
     });
 
+    {
+        let mut stdout = io::stdout().lock();
+        serde_json::to_writer(&mut stdout, &terminal_session_capabilities_line())?;
+        stdout.write_all(b"\n")?;
+        stdout.flush()?;
+    }
     write_terminal_session_output(stream)
+}
+
+/// The first record a control client prints: the optional commands this build
+/// accepts, so a controller never sends one that would only be refused.
+pub(super) fn terminal_session_capabilities_line() -> serde_json::Value {
+    serde_json::json!({
+        "type": "terminal.capabilities",
+        "host_theme": true,
+    })
 }
 
 fn connect_terminal_session_stream(
@@ -269,6 +287,101 @@ enum TerminalControlScrollSource {
     #[default]
     Wheel,
     PageKey,
+}
+
+#[derive(serde::Deserialize)]
+struct TerminalControlType {
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+#[derive(serde::Deserialize)]
+struct TerminalControlHostTheme {
+    #[serde(rename = "type")]
+    _kind: String,
+    #[serde(default)]
+    fg: Option<String>,
+    #[serde(default)]
+    bg: Option<String>,
+    #[serde(default)]
+    appearance: Option<TerminalControlAppearance>,
+    #[serde(default)]
+    palette: Option<Vec<String>>,
+}
+
+#[derive(Clone, Copy, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TerminalControlAppearance {
+    Light,
+    Dark,
+}
+
+fn parse_host_theme_color(field: &str, raw: &str) -> Result<ClientHostColor, String> {
+    let hex = raw.strip_prefix('#').unwrap_or(raw);
+    if hex.len() != 6 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!(
+            "terminal.host_theme {field} must be #rrggbb, not {raw:?}"
+        ));
+    }
+    let channel = |at: usize| u8::from_str_radix(&hex[at..at + 2], 16).unwrap_or(0);
+    Ok(ClientHostColor {
+        r: channel(0),
+        g: channel(2),
+        b: channel(4),
+    })
+}
+
+/// Parses one control line into the messages it stands for. `terminal.host_theme`
+/// becomes one host theme update per field, the appearance first so the server
+/// never infers it from the background in between.
+pub(super) fn terminal_control_messages_from_json(raw: &str) -> Result<Vec<ClientMessage>, String> {
+    let kind = serde_json::from_str::<TerminalControlType>(raw)
+        .map_err(|err| format!("invalid json command: {err}"))?
+        .kind;
+    if kind != "terminal.host_theme" {
+        return terminal_control_command_from_json(raw).map(|message| vec![message]);
+    }
+    let theme = serde_json::from_str::<TerminalControlHostTheme>(raw)
+        .map_err(|err| format!("invalid terminal.host_theme: {err}"))?;
+    let mut updates = Vec::new();
+    if let Some(appearance) = theme.appearance {
+        updates.push(ClientHostThemeUpdate::Appearance(match appearance {
+            TerminalControlAppearance::Light => ClientHostAppearance::Light,
+            TerminalControlAppearance::Dark => ClientHostAppearance::Dark,
+        }));
+    }
+    if let Some(bg) = theme.bg.as_deref() {
+        updates.push(ClientHostThemeUpdate::DefaultColor {
+            kind: ClientHostDefaultColorKind::Background,
+            color: parse_host_theme_color("bg", bg)?,
+        });
+    }
+    if let Some(fg) = theme.fg.as_deref() {
+        updates.push(ClientHostThemeUpdate::DefaultColor {
+            kind: ClientHostDefaultColorKind::Foreground,
+            color: parse_host_theme_color("fg", fg)?,
+        });
+    }
+    if let Some(palette) = theme.palette {
+        if palette.len() > 256 {
+            return Err("terminal.host_theme palette holds at most 256 colors".into());
+        }
+        let colors = palette
+            .iter()
+            .enumerate()
+            .map(|(index, color)| Ok((index as u8, parse_host_theme_color("palette", color)?)))
+            .collect::<Result<Vec<_>, String>>()?;
+        if !colors.is_empty() {
+            updates.push(ClientHostThemeUpdate::PaletteColors(colors));
+        }
+    }
+    if updates.is_empty() {
+        return Err("terminal.host_theme needs fg, bg, appearance or palette".into());
+    }
+    Ok(updates
+        .into_iter()
+        .map(|update| ClientMessage::ClientShellHostTheme { update })
+        .collect())
 }
 
 pub(super) fn terminal_control_command_from_json(raw: &str) -> Result<ClientMessage, String> {
