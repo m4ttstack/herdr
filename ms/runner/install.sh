@@ -126,6 +126,14 @@ if ! has_identity; then
   sudo -u "$CI_USER" -H security import "$P12_COPY" -k "$KEYCHAIN" -f pkcs12 -P "$P12_PASSWORD" -x -T /usr/bin/codesign
   # Lets codesign use the key without a GUI prompt, which a launchd job cannot answer.
   sudo -u "$CI_USER" -H security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+  # codesign builds the chain from keychains only; ms-release.yml re-imports these too.
+  for cer in "$(dirname "$0")"/apple/*.cer; do
+    CER_COPY=$(mktemp /tmp/herdr-signing-ca.XXXXXX)
+    cp "$cer" "$CER_COPY"
+    sudo chown "$CI_USER" "$CER_COPY"
+    sudo -u "$CI_USER" -H security import "$CER_COPY" -k "$KEYCHAIN" >/dev/null 2>&1 || true
+    sudo rm -f "$CER_COPY"
+  done
 fi
 has_identity || {
   echo "The signing keychain holds no valid Developer ID Application identity. See ms/runner/README.md." >&2; exit 1; }

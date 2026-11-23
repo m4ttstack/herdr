@@ -65,10 +65,14 @@ sudo -u herdr-signer -H security find-identity -v -p codesigning \
 ```
 
 The first lists `herdr-signer-<host> online`. The second lists one valid
-"Developer ID Application" identity. If it says the identity is not valid, the
-keychain is missing Apple's intermediate certificate: download "Developer ID -
-G2" from https://www.apple.com/certificateauthority/ and import it with
-`sudo -u herdr-signer -H security import DeveloperIDG2CA.cer -k <keychain>`.
+"Developer ID Application" identity.
+
+codesign builds the certificate chain from keychains only, never online, so
+the keychain also holds Apple's Developer ID intermediates
+(`ms/runner/apple/`, Apple's files from
+https://www.apple.com/certificateauthority/). The installer imports them, and
+every release job imports them again, so a runner set up before they existed
+needs no rerun.
 
 ## Publish
 
