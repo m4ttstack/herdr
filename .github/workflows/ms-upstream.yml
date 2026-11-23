@@ -1,0 +1,177 @@
+name: ms-upstream
+
+# Nightly: when herdrdev/herdr tags a new stable release, rebase the fork
+# commits onto it, test, and open an issue. Never publishes: ms-release.yml
+# does that, run by hand from the command in the issue.
+on:
+  schedule:
+    - cron: "0 9 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: ms-upstream
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: macos-latest
+    timeout-minutes: 120
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      UPSTREAM: https://github.com/herdrdev/herdr.git
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # The default token cannot push a branch whose new upstream commits
+          # change .github/workflows; a token with the workflow scope can.
+          token: ${{ secrets.MS_PUSH_TOKEN || github.token }}
+
+      - name: Find the newest upstream release
+        id: find
+        run: |
+          set -euo pipefail
+          source="$(git ls-remote --heads origin 'mattstack/*' | sed -n 's|.*refs/heads/\(mattstack/[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)$|\1|p' | sort -V | tail -1)"
+          [ -n "$source" ] || { echo "::error::no mattstack/<version> branch"; exit 1; }
+          current="${source#mattstack/}"
+          newest="$(git ls-remote --tags --refs "$UPSTREAM" 'v*' | sed -n 's|.*refs/tags/v\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)$|\1|p' | sort -V | tail -1)"
+          echo "fork base $current (from $source); upstream newest $newest"
+          if [ "$(printf '%s\n%s\n' "$current" "$newest" | sort -V | tail -1)" = "$current" ]; then
+            echo "Nothing newer than $current upstream."
+            echo "action=none" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if git ls-remote --exit-code --heads origin "mattstack/$newest" >/dev/null; then
+            echo "mattstack/$newest already exists."
+            echo "action=none" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          {
+            echo "action=rebase"
+            echo "source=$source"
+            echo "current=$current"
+            echo "newest=$newest"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Rebase onto the new release
+        id: rebase
+        if: steps.find.outputs.action == 'rebase'
+        run: |
+          set -uo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git fetch -q --no-tags "$UPSTREAM" "refs/tags/v${{ steps.find.outputs.current }}:refs/tags/v${{ steps.find.outputs.current }}" \
+            "refs/tags/v${{ steps.find.outputs.newest }}:refs/tags/v${{ steps.find.outputs.newest }}"
+          git switch -q "${{ steps.find.outputs.source }}"
+          ms/rebase-onto.sh "v${{ steps.find.outputs.newest }}" 2> rebase.err
+          code=$?
+          cat rebase.err >&2
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          { echo "detail<<EOF"; cat rebase.err; echo "EOF"; } >> "$GITHUB_OUTPUT"
+
+      - uses: mlugg/setup-zig@v2
+        if: steps.rebase.outputs.code == '0'
+        with:
+          version: 0.16.0
+
+      - uses: taiki-e/install-action@v2
+        if: steps.rebase.outputs.code == '0'
+        with:
+          tool: nextest
+
+      - name: Test
+        id: test
+        if: steps.rebase.outputs.code == '0'
+        run: |
+          set -uo pipefail
+          failed=""
+          cargo nextest run --locked --no-fail-fast > nextest.log 2>&1 || failed="cargo nextest run --locked"
+          tail -40 nextest.log
+          for t in ms/tests/*.sh; do
+            bash "$t" > "$t.log" 2>&1 || failed="${failed:+$failed, }$t"
+            tail -5 "$t.log"
+          done
+          echo "failed=$failed" >> "$GITHUB_OUTPUT"
+
+      - name: Push the candidate branch
+        id: push
+        if: steps.rebase.outputs.code == '0' && steps.test.outputs.failed == ''
+        run: |
+          set -uo pipefail
+          if git push -q origin "mattstack/${{ steps.find.outputs.newest }}" 2> push.err; then
+            echo "pushed=yes" >> "$GITHUB_OUTPUT"
+          else
+            cat push.err >&2
+            echo "pushed=no" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open or update the issue
+        if: always() && steps.find.outputs.action == 'rebase'
+        env:
+          CURRENT: ${{ steps.find.outputs.current }}
+          NEWEST: ${{ steps.find.outputs.newest }}
+          REBASE_CODE: ${{ steps.rebase.outputs.code }}
+          REBASE_DETAIL: ${{ steps.rebase.outputs.detail }}
+          FAILED: ${{ steps.test.outputs.failed }}
+          TEST_OUTCOME: ${{ steps.test.outcome }}
+          PUSHED: ${{ steps.push.outputs.pushed }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          T='`'
+          F='```'
+          if [ "$REBASE_CODE" = "0" ] && [ "$TEST_OUTCOME" != "success" ]; then
+            FAILED="${FAILED:-the test setup (see the run)}"
+          fi
+          compare="https://github.com/herdrdev/herdr/compare/v$CURRENT...v$NEWEST"
+          publish="gh workflow run ms-release.yml -R $REPO -f branch=mattstack/$NEWEST"
+          released="Upstream released [herdr $NEWEST]($compare)."
+          if [ "$PUSHED" = "yes" ]; then
+            title="herdr $NEWEST ready to publish"
+            body="$released The fork commits rebased onto it cleanly and every test passed, so ${T}mattstack/$NEWEST${T} is pushed.
+
+          To publish it:
+
+          ${F}bash
+          $publish
+          ${F}"
+          elif [ "$REBASE_CODE" = "0" ] && [ -z "$FAILED" ]; then
+            title="herdr $NEWEST ready to publish"
+            body="$released The fork commits rebased onto it cleanly and every test passed, but this job could not push the branch: its token cannot push upstream workflow changes (an ${T}MS_PUSH_TOKEN${T} secret with the workflow scope fixes that). Push it from a clone, then publish:
+
+          ${F}bash
+          git fetch --no-tags $UPSTREAM refs/tags/v$CURRENT:refs/tags/v$CURRENT refs/tags/v$NEWEST:refs/tags/v$NEWEST
+          git switch mattstack/$CURRENT && ms/rebase-onto.sh v$NEWEST && git push -u origin mattstack/$NEWEST
+          $publish
+          ${F}"
+          elif [ "$REBASE_CODE" = "3" ]; then
+            title="herdr $NEWEST needs a hand"
+            body="$released Rebasing the fork commits onto it conflicts:
+
+          ${F}
+          $REBASE_DETAIL
+          ${F}"
+          elif [ "$REBASE_CODE" = "0" ]; then
+            title="herdr $NEWEST needs a hand"
+            body="$released The fork commits rebased onto it cleanly, but these tests failed: $FAILED."
+          else
+            title="herdr $NEWEST needs a hand"
+            body="$released The rebase stopped before it started:
+
+          ${F}
+          $REBASE_DETAIL
+          ${F}"
+          fi
+          body="$body
+
+          [Run]($RUN_URL)"
+          existing="$(gh issue list -R "$REPO" --state open --search "in:title \"herdr $NEWEST\"" --json number,title \
+            --jq "map(select(.title == \"$title\")) | .[0].number // empty")"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" -R "$REPO" --body "$body"
+          else
+            gh issue create -R "$REPO" --title "$title" --body "$body"
+          fi
