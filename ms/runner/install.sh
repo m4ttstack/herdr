@@ -94,32 +94,40 @@ sudo -u "$CI_USER" -H bash -c '
   rustup target add aarch64-apple-darwin x86_64-apple-darwin
 '
 
-if ! sudo test -f "$KEYCHAIN"; then
-  [ -n "$P12" ] || { echo "No signing keychain yet: pass --p12 with the Developer ID Application certificate." >&2; exit 1; }
+has_identity() {
+  sudo -u "$CI_USER" -H security find-identity -v -p codesigning "$KEYCHAIN" 2>/dev/null | grep -q '"Developer ID Application:'
+}
+if ! has_identity; then
+  [ -n "$P12" ] || { echo "The signing keychain has no Developer ID Application identity yet: pass --p12." >&2; exit 1; }
   read -r -s -p "Password of $P12: " P12_PASSWORD
   echo
-  KEYCHAIN_PASSWORD=$(openssl rand -base64 24)
+  sudo -u "$CI_USER" -H mkdir -p "$(dirname "$KEYCHAIN_PASSWORD_FILE")" "$(dirname "$KEYCHAIN")"
+  sudo -u "$CI_USER" -H chmod 700 "$(dirname "$KEYCHAIN_PASSWORD_FILE")"
+  if ! sudo test -f "$KEYCHAIN"; then
+    KEYCHAIN_PASSWORD=$(openssl rand -base64 24)
+    printf '%s' "$KEYCHAIN_PASSWORD" | sudo -u "$CI_USER" -H tee "$KEYCHAIN_PASSWORD_FILE" >/dev/null
+    sudo -u "$CI_USER" -H chmod 600 "$KEYCHAIN_PASSWORD_FILE"
+    sudo -u "$CI_USER" -H security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+    # No auto-lock: a release job unlocks it with the password file.
+    sudo -u "$CI_USER" -H security set-keychain-settings "$KEYCHAIN"
+  else
+    KEYCHAIN_PASSWORD=$(sudo -u "$CI_USER" -H cat "$KEYCHAIN_PASSWORD_FILE")
+  fi
   # Not $TMPDIR: the runner user cannot read yours.
   P12_COPY=$(mktemp /tmp/herdr-signing.XXXXXX)
   trap 'sudo rm -f "$P12_COPY"' EXIT
   cp "$P12" "$P12_COPY"
   sudo chown "$CI_USER" "$P12_COPY"
   sudo chmod 600 "$P12_COPY"
-  sudo -u "$CI_USER" -H mkdir -p "$(dirname "$KEYCHAIN_PASSWORD_FILE")" "$(dirname "$KEYCHAIN")"
-  sudo -u "$CI_USER" -H chmod 700 "$(dirname "$KEYCHAIN_PASSWORD_FILE")"
-  printf '%s' "$KEYCHAIN_PASSWORD" | sudo -u "$CI_USER" -H tee "$KEYCHAIN_PASSWORD_FILE" >/dev/null
-  sudo -u "$CI_USER" -H chmod 600 "$KEYCHAIN_PASSWORD_FILE"
-  sudo -u "$CI_USER" -H security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
-  # No auto-lock: a release job unlocks it with the password file.
-  sudo -u "$CI_USER" -H security set-keychain-settings "$KEYCHAIN"
   sudo -u "$CI_USER" -H security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+  # -f: the copy has no .p12 extension to infer the format from.
   # -x: the private key can never be exported from this keychain, even by a
   # job that knows the keychain password.
-  sudo -u "$CI_USER" -H security import "$P12_COPY" -k "$KEYCHAIN" -P "$P12_PASSWORD" -x -T /usr/bin/codesign
+  sudo -u "$CI_USER" -H security import "$P12_COPY" -k "$KEYCHAIN" -f pkcs12 -P "$P12_PASSWORD" -x -T /usr/bin/codesign
   # Lets codesign use the key without a GUI prompt, which a launchd job cannot answer.
   sudo -u "$CI_USER" -H security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
 fi
-sudo -u "$CI_USER" -H security find-identity -v -p codesigning "$KEYCHAIN" | grep -q '"Developer ID Application:' || {
+has_identity || {
   echo "The signing keychain holds no valid Developer ID Application identity. See ms/runner/README.md." >&2; exit 1; }
 
 if ! sudo test -f "$DIR/.runner"; then
