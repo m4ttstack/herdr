@@ -759,7 +759,10 @@ impl HeadlessServer {
                 ClientConnectionMode::TerminalPending => continue,
                 ClientConnectionMode::TerminalAttach { terminal_id }
                 | ClientConnectionMode::TerminalObserve { terminal_id } => {
-                    let Some(runtime) = self.runtime_for_terminal_id_string(&terminal_id) else {
+                    let runtime = self
+                        .terminal_id_by_string(&terminal_id)
+                        .and_then(|id| self.app.terminal_runtimes.get(&id));
+                    let Some(runtime) = runtime else {
                         self.send_to_client(
                             client_id,
                             ServerMessage::ServerShutdown {
@@ -802,12 +805,25 @@ impl HeadlessServer {
                         continue;
                     }
                     let frame_started = crate::render_prof::timer();
-                    let frame = FrameData::from_ratatui_buffer_with_hyperlinks(
+                    let mut frame = FrameData::from_ratatui_buffer_with_hyperlinks(
                         &buffer,
                         cursor,
                         &hyperlinks,
                     );
                     crate::render_prof::duration_since("full_render.frame_build", frame_started);
+                    if let Some(client) = self.clients.get_mut(&client_id) {
+                        let cell_size = if self.app.state.kitty_graphics_enabled {
+                            client.cell_size
+                        } else {
+                            crate::kitty_graphics::HostCellSize::default()
+                        };
+                        frame.graphics = crate::kitty_graphics::encode_direct_terminal_graphics(
+                            runtime,
+                            area,
+                            cell_size,
+                            &mut client.direct_terminal_graphics,
+                        );
+                    }
                     frame
                 }
             };

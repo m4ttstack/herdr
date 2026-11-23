@@ -24,7 +24,7 @@ impl PaneId {
     }
 
     /// Reconstruct from a saved u32 (persistence only).
-    pub fn from_raw(id: u32) -> Self {
+    pub const fn from_raw(id: u32) -> Self {
         Self(id)
     }
 }

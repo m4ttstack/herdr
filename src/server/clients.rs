@@ -143,6 +143,8 @@ pub(crate) struct ClientConnection {
     pub(crate) render_state: ClientRenderState,
     /// Image assets already included in the selected ClientShell scene.
     pub(crate) shell_graphics_delivery: crate::kitty_graphics::surface::DeliveryCache,
+    /// Images already on a direct terminal client's host surface.
+    pub(crate) direct_terminal_graphics: crate::kitty_graphics::HostGraphicsCache,
     /// Passive eligibility for audited local Kitty regular-file graphics.
     pub(crate) direct_graphics: bool,
     /// Whether this frontend preserves exact SGR pixel reports.
@@ -230,6 +232,7 @@ impl ClientConnection {
             last_activity,
             render_state: ClientRenderState::new(render_encoding),
             shell_graphics_delivery: crate::kitty_graphics::surface::DeliveryCache::default(),
+            direct_terminal_graphics: crate::kitty_graphics::HostGraphicsCache::default(),
             direct_graphics: false,
             pixel_mouse: false,
             host_terminal_theme: crate::terminal_theme::TerminalTheme::default(),

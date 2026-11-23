@@ -106,6 +106,9 @@ fn apply_pane_terminal_env(cmd: &mut CommandBuilder) {
     cmd.env("COLORTERM", PANE_COLORTERM);
     cmd.env("TERM_PROGRAM", "herdr");
     cmd.env("TERM_PROGRAM_VERSION", crate::build_info::version());
+    // Marks a server that sends session-control clients their kitty images;
+    // the version string cannot tell this build from upstream.
+    cmd.env("HERDR_SESSION_CONTROL_IMAGES", "1");
     // fish only skips its own resize repaint for terminals it recognizes as
     // reflowing. Herdr reflows too, and the competing repaint glues prompt copies.
     // Match the exact casing: Windows env keys are case-insensitive here, but
@@ -4398,6 +4401,10 @@ mod tests {
         assert_eq!(
             cmd.get_env("TERM_PROGRAM_VERSION"),
             Some(OsStr::new(&crate::build_info::version()))
+        );
+        assert_eq!(
+            cmd.get_env("HERDR_SESSION_CONTROL_IMAGES"),
+            Some(OsStr::new("1"))
         );
     }
 

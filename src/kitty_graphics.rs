@@ -371,6 +371,82 @@ fn collect_visible_placements(
     placements
 }
 
+/// The client draws only this terminal, in a host surface of its own, so
+/// image ids need no pane to keep them apart.
+const DIRECT_TERMINAL_PANE: PaneId = PaneId::from_raw(0);
+
+/// Kitty bytes that show one terminal's images on a client that draws only
+/// that terminal at its origin. Placements replay on every call because a
+/// full ANSI frame clears the client's screen, and its placements with it.
+pub(crate) fn encode_direct_terminal_graphics(
+    runtime: &crate::terminal::TerminalRuntime,
+    area: Rect,
+    cell_size: HostCellSize,
+    cache: &mut HostGraphicsCache,
+) -> Vec<u8> {
+    if !cell_size.is_known() {
+        return encode_direct_placements(Vec::new(), 0, area, cell_size, cache);
+    }
+    let mut requested = HashSet::new();
+    let placements = runtime.kitty_image_placements_with_data_filter(|descriptor| {
+        !descriptor.source_file && direct_image_needs_data(cache, descriptor, &mut requested)
+    });
+    let scrollback_offset = runtime
+        .scroll_metrics()
+        .map(|metrics| metrics.offset_from_bottom as u32)
+        .unwrap_or(0);
+    encode_direct_placements(placements, scrollback_offset, area, cell_size, cache)
+}
+
+fn direct_image_needs_data(
+    cache: &HostGraphicsCache,
+    descriptor: KittyImageDescriptor,
+    requested: &mut HashSet<u32>,
+) -> bool {
+    let signature = image_signature_from_descriptor(descriptor, kitty_format_code(descriptor.format));
+    let host_id = host_image_id_for_signature(DIRECT_TERMINAL_PANE, signature);
+    cache.images.get(&host_id) != Some(&signature) && requested.insert(host_id)
+}
+
+fn encode_direct_placements(
+    placements: Vec<KittyImagePlacement>,
+    scrollback_offset: u32,
+    area: Rect,
+    cell_size: HostCellSize,
+    cache: &mut HostGraphicsCache,
+) -> Vec<u8> {
+    let body = if cell_size.is_known() {
+        let placements = placements
+            .into_iter()
+            .map(|placement| HostPlacement {
+                raw_data: None,
+                pane_id: DIRECT_TERMINAL_PANE,
+                host_image_id: None,
+                area,
+                cell_size,
+                source_key: HostSourceKey::Terminal {
+                    pane_id: DIRECT_TERMINAL_PANE,
+                    image_id: placement.image_id,
+                },
+                placement,
+                scrollback_offset,
+            })
+            .collect::<Vec<_>>();
+        cache.request_placement_replay();
+        encode_graphics_output(cache, &placements).into_inline_bytes()
+    } else {
+        cache.clear_bytes()
+    };
+    if body.is_empty() {
+        return body;
+    }
+    let mut bytes = Vec::with_capacity(body.len() + 4);
+    bytes.extend_from_slice(b"\x1b7");
+    bytes.extend_from_slice(&body);
+    bytes.extend_from_slice(b"\x1b8");
+    bytes
+}
+
 fn terminal_image_needs_data(
     pane_id: PaneId,
     descriptor: KittyImageDescriptor,
@@ -720,6 +796,109 @@ pub(crate) fn write_kitty_data(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn direct_placement(viewport_col: i32, viewport_row: i32) -> KittyImagePlacement {
+        test_placement(viewport_col, viewport_row).placement
+    }
+
+    fn direct_cell() -> HostCellSize {
+        HostCellSize {
+            width_px: 10,
+            height_px: 10,
+        }
+    }
+
+    #[test]
+    fn direct_terminal_graphics_uploads_once_and_replays_placement_inside_saved_cursor() {
+        let mut cache = HostGraphicsCache::default();
+        let area = Rect::new(0, 0, 20, 10);
+        let first = String::from_utf8(encode_direct_placements(
+            vec![direct_placement(2, 1)],
+            0,
+            area,
+            direct_cell(),
+            &mut cache,
+        ))
+        .unwrap();
+        assert!(first.starts_with("\x1b7"));
+        assert!(first.ends_with("\x1b8"));
+        assert!(first.contains("a=t,"), "{first:?}");
+        assert!(first.contains("\x1b[2;3H\x1b_Ga=p,"), "{first:?}");
+
+        let mut again = direct_placement(2, 1);
+        again.data.clear();
+        let second = String::from_utf8(encode_direct_placements(
+            vec![again],
+            0,
+            area,
+            direct_cell(),
+            &mut cache,
+        ))
+        .unwrap();
+        assert!(!second.contains("a=t,"), "{second:?}");
+        assert!(second.contains("a=p,"), "{second:?}");
+    }
+
+    #[test]
+    fn direct_terminal_graphics_needs_data_only_for_images_the_client_lacks() {
+        let mut cache = HostGraphicsCache::default();
+        let placement = direct_placement(0, 0);
+        let descriptor = KittyImageDescriptor {
+            image_id: placement.image_id,
+            placement_id: placement.placement_id,
+            image_width: placement.image_width,
+            image_height: placement.image_height,
+            format: placement.format,
+            data_len: placement.data_len,
+            data_fingerprint: placement.data_fingerprint,
+            source_file: false,
+        };
+        let mut requested = HashSet::new();
+        assert!(direct_image_needs_data(&cache, descriptor, &mut requested));
+        assert!(!direct_image_needs_data(&cache, descriptor, &mut requested));
+        encode_direct_placements(
+            vec![placement],
+            0,
+            Rect::new(0, 0, 20, 10),
+            direct_cell(),
+            &mut cache,
+        );
+        assert!(!direct_image_needs_data(&cache, descriptor, &mut HashSet::new()));
+    }
+
+    #[test]
+    fn direct_terminal_graphics_deletes_images_once_placements_go() {
+        let mut cache = HostGraphicsCache::default();
+        let area = Rect::new(0, 0, 20, 10);
+        encode_direct_placements(vec![direct_placement(0, 0)], 0, area, direct_cell(), &mut cache);
+        let gone = String::from_utf8(encode_direct_placements(
+            Vec::new(),
+            0,
+            area,
+            direct_cell(),
+            &mut cache,
+        ))
+        .unwrap();
+        assert!(gone.contains("a=d,"), "{gone:?}");
+        assert!(encode_direct_placements(Vec::new(), 0, area, direct_cell(), &mut cache).is_empty());
+    }
+
+    #[test]
+    fn direct_terminal_graphics_clears_without_a_cell_size() {
+        let mut cache = HostGraphicsCache::default();
+        let area = Rect::new(0, 0, 20, 10);
+        encode_direct_placements(vec![direct_placement(0, 0)], 0, area, direct_cell(), &mut cache);
+        let cleared = String::from_utf8(encode_direct_placements(
+            vec![direct_placement(0, 0)],
+            0,
+            area,
+            HostCellSize::default(),
+            &mut cache,
+        ))
+        .unwrap();
+        assert!(cleared.contains("a=d,d=I,"), "{cleared:?}");
+        assert!(!cleared.contains("a=p,"), "{cleared:?}");
+    }
 
     #[test]
     fn deferred_updates_match_inline_for_rgb_and_rgba() {
