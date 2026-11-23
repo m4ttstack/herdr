@@ -1,0 +1,145 @@
+name: ms-release
+
+# Builds, signs and publishes one mattstack fork build, v<base>-ms.<N>, from a
+# mattstack/<base> branch. Runs only by hand, only on the herdr-signer runner,
+# whose job-started hook refuses every other workflow and event.
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch to build, mattstack/<upstream version>"
+        required: true
+        type: string
+        default: mattstack/0.9.5
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ms-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: [self-hosted, herdr-signer]
+    timeout-minutes: 90
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      BRANCH: ${{ inputs.branch }}
+    steps:
+      - name: Check the branch name
+        run: |
+          case "$BRANCH" in
+            mattstack/[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::branch must be mattstack/<upstream version>, not $BRANCH"; exit 1 ;;
+          esac
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+          fetch-depth: 0
+
+      - name: Pick the version
+        id: version
+        run: |
+          set -euo pipefail
+          base="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+          [ "$BRANCH" = "mattstack/$base" ] || { echo "::error::$BRANCH builds herdr $base; expected branch mattstack/$base"; exit 1; }
+          tags="$(gh release list -R "$REPO" --limit 1000 --json tagName --jq '.[].tagName')"
+          last="$(printf '%s\n' "$tags" | sed -n "s/^v${base//./\\.}-ms\.\([0-9][0-9]*\)$/\1/p" | sort -n | tail -1)"
+          revision=$(( ${last:-0} + 1 ))
+          newest_base="$(printf '%s\n' "$tags" | sed -n 's/^v\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)-ms\.[0-9][0-9]*$/\1/p' | sort -V | tail -1)"
+          {
+            echo "base=$base"
+            echo "revision=$revision"
+            echo "version=$base-ms.$revision"
+            echo "sha=$(git rev-parse HEAD)"
+            echo "newest_base=${newest_base:-$base}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Publishing herdr $base-ms.$revision from $BRANCH at $(git rev-parse --short HEAD)"
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          ms/build.sh --arch arm64 --revision "${{ steps.version.outputs.revision }}" --out dist
+          ms/build.sh --arch x86_64 --revision "${{ steps.version.outputs.revision }}" --out dist
+
+      - name: Sign
+        run: |
+          set -euo pipefail
+          : "${HERDR_SIGNING_KEYCHAIN:?the runner has no signing keychain; see ms/runner/README.md}"
+          security unlock-keychain -p "$(cat "$HERDR_SIGNING_KEYCHAIN_PASSWORD_FILE")" "$HERDR_SIGNING_KEYCHAIN"
+          identity="$(security find-identity -v -p codesigning "$HERDR_SIGNING_KEYCHAIN" \
+            | sed -n 's/.*"\(Developer ID Application:.*\)"/\1/p' | head -n1)"
+          [ -n "$identity" ] || { echo "::error::no Developer ID Application identity in the signing keychain"; exit 1; }
+          for asset in herdr-macos-aarch64 herdr-macos-x86_64; do
+            codesign --force --sign "$identity" --keychain "$HERDR_SIGNING_KEYCHAIN" \
+              --options runtime --timestamp "dist/$asset"
+          done
+
+      - name: Verify signatures, architectures and version
+        run: |
+          set -euo pipefail
+          for pair in herdr-macos-aarch64:arm64 herdr-macos-x86_64:x86_64; do
+            asset="${pair%%:*}"; arch="${pair#*:}"
+            codesign --verify --strict "dist/$asset"
+            got="$(lipo -archs "dist/$asset")"
+            [ "$got" = "$arch" ] || { echo "::error::$asset is $got, expected $arch"; exit 1; }
+          done
+          case "$(uname -m)" in
+            arm64) native=herdr-macos-aarch64 ;;
+            *) native=herdr-macos-x86_64 ;;
+          esac
+          reported="$(env -i HOME="$(mktemp -d)" PATH=/usr/bin:/bin "dist/$native" --version)"
+          want="herdr ${{ steps.version.outputs.version }}"
+          [ "$reported" = "$want" ] || { echo "::error::$native reports '$reported', expected '$want'"; exit 1; }
+
+      - name: Write manifests
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          if [ -n "$(gh release list -R "$REPO" --limit 1 --exclude-drafts --exclude-pre-releases --json tagName --jq '.[].tagName')" ]; then
+            gh release download -R "$REPO" --pattern herdr-builds.json --dir previous
+            previous=previous/herdr-builds.json
+          else
+            previous=none
+          fi
+          cat > notes.md <<EOF
+          herdr $version (mattstack fork), built from \`$BRANCH\` at ${{ steps.version.outputs.sha }}.
+
+          This build is not made or endorsed by herdr's maintainers. See the [README](https://github.com/$REPO#readme) for what it changes.
+          EOF
+          ms/manifests.sh --version "$version" --base "${{ steps.version.outputs.base }}" \
+            --revision "${{ steps.version.outputs.revision }}" \
+            --arm64 dist/herdr-macos-aarch64 --x86_64 dist/herdr-macos-x86_64 \
+            --previous "$previous" --notes notes.md --out dist
+          for asset in herdr-macos-aarch64 herdr-macos-x86_64; do
+            (cd dist && shasum -a 256 "$asset" > "$asset.sha256")
+          done
+          cp LICENSE dist/LICENSE
+
+      - name: Publish
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          gh release create "v$version" -R "$REPO" --target "${{ steps.version.outputs.sha }}" --latest \
+            --title "herdr $version (mattstack fork)" --notes-file notes.md \
+            dist/herdr-macos-aarch64 dist/herdr-macos-x86_64 \
+            dist/herdr-macos-aarch64.sha256 dist/herdr-macos-x86_64.sha256 \
+            dist/LICENSE dist/herdr-builds.json dist/latest.json
+
+      - name: Default branch
+        run: |
+          set -euo pipefail
+          base="${{ steps.version.outputs.base }}"
+          newest="$(printf '%s\n%s\n' "$base" "${{ steps.version.outputs.newest_base }}" | sort -V | tail -1)"
+          current="$(gh repo view "$REPO" --json defaultBranchRef --jq .defaultBranchRef.name)"
+          if [ "$newest" = "$base" ] && [ "$current" != "$BRANCH" ]; then
+            echo "::warning::$BRANCH is now the newest base. Make it the default branch (the job's token cannot): gh repo edit $REPO --default-branch $BRANCH"
+          fi
+
+      - name: Lock the signing keychain
+        if: always()
+        run: |
+          [ -z "${HERDR_SIGNING_KEYCHAIN:-}" ] || security lock-keychain "$HERDR_SIGNING_KEYCHAIN"
