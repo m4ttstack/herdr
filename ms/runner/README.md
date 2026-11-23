@@ -26,9 +26,13 @@ that Mac's keychain; it is never a GitHub secret.
 
 On the signing Mac:
 
-1. Install `gh` (signed in to an account that administers `m4ttstack/herdr`),
-   `jq` and zig 0.16.0: `brew install gh jq zig`, then `zig version` must print
-   `0.16.0`.
+1. Put `gh`, `jq` and zig 0.16.0 where the `herdr-signer` user can run them:
+   `/usr/local/bin` or `/opt/homebrew/bin` (`jq` ships with macOS at
+   `/usr/bin/jq`). On Apple silicon, `brew install gh jq zig`. On an Intel Mac,
+   which Homebrew no longer supports, unpack zig from
+   https://ziglang.org/download/ (`zig-x86_64-macos-0.16.0.tar.xz`) into a
+   folder only you can write, such as `/Users/Shared/herdr-tools`, and link
+   `zig` and a copy of `gh` into `/usr/local/bin`.
 2. On the Mac that holds the certificate, open Keychain Access, find
    "Developer ID Application: …" under My Certificates, and export it with its
    private key as a `.p12` with a password. Copy the file to the signing Mac.
@@ -36,7 +40,15 @@ On the signing Mac:
    password), at the root of a clone of `m4ttstack/herdr`:
 
    ```bash
-   ms/runner/install.sh --p12 ~/Downloads/developer-id.p12
+   ms/runner/install.sh --p12 ~/developer-id.p12
+   ```
+
+   If `gh` on the signing Mac is not signed in, mint the runner registration
+   token on a Mac where it is, and run the install over SSH from there:
+
+   ```bash
+   ssh -t <signing mac> "cd <clone> && ms/runner/install.sh --p12 ~/developer-id.p12 \
+     --registration-token $(gh api -X POST repos/m4ttstack/herdr/actions/runners/registration-token --jq .token)"
    ```
 
 4. Delete the `.p12` copy.

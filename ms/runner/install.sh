@@ -3,15 +3,21 @@
 # signs m4ttstack/herdr releases. Run it on the signing Mac, from a real terminal
 # at the repo root, as yourself: it needs sudo's password prompt, your gh login
 # and the Developer ID Application certificate exported as a .p12.
-# Usage: ms/runner/install.sh --p12 PATH
+# Usage: ms/runner/install.sh --p12 PATH [--registration-token TOKEN]
+# --registration-token takes a runner registration token minted elsewhere
+# (gh api -X POST repos/m4ttstack/herdr/actions/runners/registration-token),
+# for a Mac whose gh is not signed in.
 set -euo pipefail
 
 P12=""
+REGISTRATION_TOKEN=""
+USAGE="usage: ms/runner/install.sh --p12 PATH [--registration-token TOKEN]"
 while [ $# -gt 0 ]; do
   case "$1" in
     --p12) P12="${2:-}"; shift 2 ;;
-    -h|--help) echo "usage: ms/runner/install.sh --p12 PATH"; exit 0 ;;
-    *) echo "Unknown option $1. Usage: ms/runner/install.sh --p12 PATH" >&2; exit 2 ;;
+    --registration-token) REGISTRATION_TOKEN="${2:-}"; shift 2 ;;
+    -h|--help) echo "$USAGE"; exit 0 ;;
+    *) echo "Unknown option $1. $USAGE" >&2; exit 2 ;;
   esac
 done
 # Before anything changes this Mac: a wrong path most likely means the wrong Mac.
@@ -44,12 +50,19 @@ TOOL_PATH=$CI_HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/us
 
 [ "$(id -u)" != 0 ] || { echo "Run this as yourself, not root." >&2; exit 1; }
 [ -f ms/runner/job-started.sh ] || { echo "Run this from the repo root." >&2; exit 1; }
-command -v gh >/dev/null || { echo "Install gh and run gh auth login first." >&2; exit 1; }
-gh auth status --hostname github.com >/dev/null
+if [ -z "$REGISTRATION_TOKEN" ]; then
+  command -v gh >/dev/null || { echo "Install gh and run gh auth login first, or pass --registration-token." >&2; exit 1; }
+  gh auth status --hostname github.com >/dev/null
+fi
+# Release jobs run as $CI_USER with only $TOOL_PATH, so the tools must be there,
+# not in your home.
+for tool in gh jq zig; do
+  PATH="$TOOL_PATH" command -v "$tool" >/dev/null || {
+    echo "Release jobs need $tool in /usr/local/bin or /opt/homebrew/bin (see ms/runner/README.md)." >&2; exit 1; }
+done
+[ "$(PATH="$TOOL_PATH" zig version)" = "$ZIG_VERSION" ] || {
+  echo "zig in /usr/local/bin or /opt/homebrew/bin is $(PATH="$TOOL_PATH" zig version); herdr's build needs $ZIG_VERSION." >&2; exit 1; }
 PATH="$TOOL_PATH:$PATH"
-command -v jq >/dev/null || { echo "Install jq first (brew install jq)." >&2; exit 1; }
-command -v zig >/dev/null || { echo "Install zig $ZIG_VERSION first; herdr's build needs it." >&2; exit 1; }
-[ "$(zig version)" = "$ZIG_VERSION" ] || { echo "zig is $(zig version); herdr's build needs $ZIG_VERSION." >&2; exit 1; }
 
 sudo -v
 
@@ -112,7 +125,7 @@ if ! sudo test -f "$DIR/.runner"; then
   curl -fsSL -o "$TARBALL" "https://github.com/actions/runner/releases/download/v$VERSION/actions-runner-osx-$RUNNER_ARCH-$VERSION.tar.gz"
   echo "$SHA256  $TARBALL" | shasum -a 256 -c -
   chmod 644 "$TARBALL"
-  token=$(gh api -X POST "repos/$REPO/actions/runners/registration-token" --jq .token)
+  token=${REGISTRATION_TOKEN:-$(gh api -X POST "repos/$REPO/actions/runners/registration-token" --jq .token)}
   sudo -u "$CI_USER" -H mkdir -p "$DIR"
   sudo -u "$CI_USER" -H tar xzf "$TARBALL" -C "$DIR"
   rm -f "$TARBALL"
