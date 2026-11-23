@@ -161,6 +161,13 @@ fn channel_set(args: &[String]) -> std::io::Result<i32> {
         return Ok(2);
     };
 
+    if channel == "preview" {
+        if let Err(reason) = crate::update::preview_channel_allowed(crate::build_info::is_fork()) {
+            eprintln!("{reason}");
+            return Ok(1);
+        }
+    }
+
     if let Some(reason) = channel_set_rejection(
         channel,
         crate::update::preview_channel_rejection_for_current_install(),
