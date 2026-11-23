@@ -189,6 +189,11 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         // Carried across before any client attaches, so the first title sent is
         // the override rather than the configured one it replaced.
         server.api_window_title = received.manifest.api_window_title.take();
+        // Before any client attaches, so a pane that queries its colors in the
+        // gap gets the controller's theme rather than none.
+        if let Some(theme) = received.manifest.terminal_attach_host_theme.take() {
+            server.restore_handed_off_host_theme(&theme);
+        }
         // A restart announced before the handoff still commits after it.
         server
             .host_shutdown_intent

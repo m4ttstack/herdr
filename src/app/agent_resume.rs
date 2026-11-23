@@ -176,6 +176,18 @@ impl App {
         pane_infos
     }
 
+    pub(crate) fn terminal_has_pending_agent_resume(
+        &self,
+        terminal_id: &crate::terminal::TerminalId,
+    ) -> bool {
+        self.terminal_runtimes.get(terminal_id).is_none()
+            && self
+                .state
+                .terminals
+                .get(terminal_id)
+                .is_some_and(|terminal| terminal.pending_agent_resume_plan.is_some())
+    }
+
     pub(crate) fn start_pending_agent_resume_for_terminal(
         &mut self,
         terminal_id: &crate::terminal::TerminalId,

@@ -51,6 +51,30 @@ pub(crate) struct HandoffManifest {
     /// committed. Absent from manifests written before this field existed.
     #[serde(default)]
     pub host_shutdown_intent: Option<crate::platform::HostShutdownIntent>,
+    /// The host theme a terminal controller set. Carried so panes keep
+    /// answering color queries with it until the controller reconnects.
+    /// Absent from manifests written before this field existed.
+    #[serde(default)]
+    pub terminal_attach_host_theme: Option<HandoffHostTheme>,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct HandoffHostTheme {
+    pub foreground: Option<[u8; 3]>,
+    pub background: Option<[u8; 3]>,
+    #[serde(default)]
+    pub palette: Vec<(u8, [u8; 3])>,
+    pub appearance: Option<HandoffHostAppearance>,
+    pub appearance_explicit: bool,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum HandoffHostAppearance {
+    Light,
+    Dark,
 }
 
 #[cfg(unix)]
@@ -323,6 +347,7 @@ pub(crate) fn manifest_for(
         panes,
         api_window_title,
         host_shutdown_intent,
+        terminal_attach_host_theme: None,
     }
 }
 
@@ -572,6 +597,39 @@ mod tests {
             serde_json::from_slice(&encoded).expect("manifest should deserialize");
 
         assert_eq!(decoded.host_shutdown_intent, Some(intent));
+    }
+
+    #[test]
+    fn a_handoff_carries_a_terminal_controller_host_theme() {
+        let mut manifest = manifest_for(empty_snapshot(), Vec::new(), None, None, None, None);
+        let theme = HandoffHostTheme {
+            foreground: Some([76, 79, 105]),
+            background: Some([239, 241, 245]),
+            palette: vec![(4, [30, 102, 245])],
+            appearance: Some(HandoffHostAppearance::Light),
+            appearance_explicit: true,
+        };
+        manifest.terminal_attach_host_theme = Some(theme.clone());
+        let encoded = serde_json::to_vec(&manifest).expect("manifest should serialize");
+        let decoded: HandoffManifest =
+            serde_json::from_slice(&encoded).expect("manifest should deserialize");
+
+        assert_eq!(decoded.terminal_attach_host_theme, Some(theme));
+    }
+
+    #[test]
+    fn a_manifest_written_before_the_host_theme_field_still_loads() {
+        let manifest = manifest_for(empty_snapshot(), Vec::new(), None, None, None, None);
+        let mut value = serde_json::to_value(&manifest).expect("manifest should serialize");
+        value
+            .as_object_mut()
+            .expect("manifest should be a json object")
+            .remove("terminal_attach_host_theme");
+
+        let older: HandoffManifest =
+            serde_json::from_value(value).expect("an older manifest should still load");
+
+        assert!(older.terminal_attach_host_theme.is_none());
     }
 
     #[test]

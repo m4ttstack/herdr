@@ -115,6 +115,8 @@ fn test_headless_server_with_event_hub(event_hub: api::EventHub) -> HeadlessServ
         next_client_id: 1,
         foreground_client_id: None,
         terminal_attach_host_theme: None,
+        theme_waiting_resumes: HashMap::new(),
+        host_theme_settles_at: None,
         tab_geometry_controllers: HashMap::new(),
         popup_owner_tab_id: None,
         client_shell_boot_id: "test-boot".into(),
@@ -8487,4 +8489,216 @@ fn terminal_attach_host_theme_returns_when_the_foreground_client_leaves() {
         Some(crate::terminal_theme::HostAppearance::Light)
     );
     assert!(server.app.state.host_terminal_appearance_explicit);
+}
+
+/// A restored terminal whose agent waits to be resumed, with no runtime yet
+/// and no view geometry, so only a terminal attach can start it.
+#[cfg(unix)]
+fn server_with_pending_agent_resume() -> (HeadlessServer, crate::terminal::TerminalId) {
+    let mut server = test_headless_server();
+    let workspace = crate::workspace::Workspace::test_new("restored");
+    let pane_id = workspace.tabs[0].root_pane;
+    let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
+    server.app.state.workspaces = vec![workspace];
+    server.app.state.active = Some(0);
+    server.app.state.ensure_test_terminals();
+    server
+        .app
+        .state
+        .terminals
+        .get_mut(&terminal_id)
+        .expect("test terminal should exist")
+        .pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
+        agent: "codex".into(),
+        argv: vec!["/bin/sh".into(), "-c".into(), "sleep 5".into()],
+        dedupe_key: "herdr:codex\0codex\0Id\0codex-session".into(),
+    });
+    (server, terminal_id)
+}
+
+#[cfg(unix)]
+fn control_terminal(
+    server: &mut HeadlessServer,
+    client_id: u64,
+    terminal_id: &crate::terminal::TerminalId,
+) {
+    connect_pending_terminal_client(server, client_id);
+    assert!(
+        server.handle_server_event(ServerEvent::ClientControlTerminal {
+            client_id,
+            target: terminal_id.to_string(),
+            takeover: false,
+        })
+    );
+}
+
+#[cfg(unix)]
+const LIGHT_GROUND: protocol::ClientHostColor = protocol::ClientHostColor {
+    r: 239,
+    g: 241,
+    b: 245,
+};
+
+#[cfg(unix)]
+#[tokio::test]
+async fn terminal_attach_holds_an_agent_resume_until_the_controller_sends_its_theme() {
+    let (mut server, terminal_id) = server_with_pending_agent_resume();
+    control_terminal(&mut server, 7, &terminal_id);
+
+    assert!(server.app.terminal_runtimes.get(&terminal_id).is_none());
+    assert!(server.theme_waiting_resumes.contains_key(&terminal_id));
+
+    server.handle_server_event(ServerEvent::ClientShellHostTheme {
+        client_id: 7,
+        update: protocol::ClientHostThemeUpdate::Appearance(protocol::ClientHostAppearance::Light),
+    });
+    let background = protocol::ClientHostThemeUpdate::DefaultColor {
+        kind: protocol::ClientHostDefaultColorKind::Background,
+        color: LIGHT_GROUND,
+    };
+    assert!(
+        server.handle_server_event(ServerEvent::ClientShellHostTheme {
+            client_id: 7,
+            update: background,
+        })
+    );
+    server.handle_scheduled_tasks_headless(Instant::now(), false);
+    assert!(
+        server.app.terminal_runtimes.get(&terminal_id).is_none(),
+        "the background alone is not the whole line"
+    );
+    assert!(
+        server.handle_server_event(ServerEvent::ClientShellHostTheme {
+            client_id: 7,
+            update: protocol::ClientHostThemeUpdate::DefaultColor {
+                kind: protocol::ClientHostDefaultColorKind::Foreground,
+                color: DARK_TEXT,
+            },
+        })
+    );
+    let settles = server
+        .host_theme_settles_at
+        .expect("a theme update should set the settle time");
+    assert_eq!(server.next_theme_waiting_resume_deadline(), Some(settles));
+    server.handle_scheduled_tasks_headless(settles - Duration::from_millis(1), false);
+    assert!(server.app.terminal_runtimes.get(&terminal_id).is_none());
+
+    assert!(server.handle_scheduled_tasks_headless(settles, false));
+    assert!(server.app.terminal_runtimes.get(&terminal_id).is_some());
+    assert_eq!(
+        server.app.state.host_terminal_theme.foreground,
+        Some(DARK_TEXT.into()),
+        "the agent starts with the whole line applied"
+    );
+    assert!(server.theme_waiting_resumes.is_empty());
+    assert!(server
+        .app
+        .state
+        .terminals
+        .get(&terminal_id)
+        .expect("test terminal should still exist")
+        .pending_agent_resume_plan
+        .is_none());
+    shutdown_test_runtimes(&mut server);
+}
+
+#[cfg(unix)]
+const DARK_TEXT: protocol::ClientHostColor = protocol::ClientHostColor {
+    r: 76,
+    g: 79,
+    b: 105,
+};
+
+/// A line carrying only a background still releases the resume once it has
+/// settled, well before the deadline.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_partial_theme_line_releases_a_held_resume_once_it_settles() {
+    let (mut server, terminal_id) = server_with_pending_agent_resume();
+    control_terminal(&mut server, 7, &terminal_id);
+    let deadline = server.theme_waiting_resumes[&terminal_id].deadline;
+
+    server.handle_server_event(ServerEvent::ClientShellHostTheme {
+        client_id: 7,
+        update: protocol::ClientHostThemeUpdate::DefaultColor {
+            kind: protocol::ClientHostDefaultColorKind::Background,
+            color: LIGHT_GROUND,
+        },
+    });
+    let settles = server.host_theme_settles_at.expect("settle time");
+    assert!(settles < deadline);
+
+    assert!(server.handle_scheduled_tasks_headless(settles, false));
+    assert!(server.app.terminal_runtimes.get(&terminal_id).is_some());
+    shutdown_test_runtimes(&mut server);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_held_back_agent_resume_starts_at_its_deadline_without_a_theme() {
+    let (mut server, terminal_id) = server_with_pending_agent_resume();
+    control_terminal(&mut server, 7, &terminal_id);
+    let deadline = server.theme_waiting_resumes[&terminal_id].deadline;
+    assert!(deadline > Instant::now());
+    assert_eq!(server.next_theme_waiting_resume_deadline(), Some(deadline));
+
+    server.handle_scheduled_tasks_headless(deadline - Duration::from_millis(1), false);
+    assert!(server.app.terminal_runtimes.get(&terminal_id).is_none());
+
+    assert!(server.handle_scheduled_tasks_headless(deadline, false));
+    assert!(server.app.terminal_runtimes.get(&terminal_id).is_some());
+    assert!(server.theme_waiting_resumes.is_empty());
+    shutdown_test_runtimes(&mut server);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn terminal_attach_resumes_at_once_when_the_session_has_a_theme() {
+    let (mut server, terminal_id) = server_with_pending_agent_resume();
+    let mut theme = crate::terminal_theme::TerminalTheme::default();
+    theme.background = Some(LIGHT_GROUND.into());
+    server.app.set_host_terminal_theme(theme);
+
+    control_terminal(&mut server, 7, &terminal_id);
+
+    assert!(server.app.terminal_runtimes.get(&terminal_id).is_some());
+    assert!(server.theme_waiting_resumes.is_empty());
+    shutdown_test_runtimes(&mut server);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_terminal_controller_theme_crosses_a_handoff() {
+    let mut theme = crate::terminal_theme::TerminalTheme::default();
+    theme.foreground = Some(crate::terminal_theme::RgbColor {
+        r: 76,
+        g: 79,
+        b: 105,
+    });
+    theme.background = Some(LIGHT_GROUND.into());
+    theme.palette[4] = Some(crate::terminal_theme::RgbColor {
+        r: 30,
+        g: 102,
+        b: 245,
+    });
+    let applied = TerminalAttachHostTheme {
+        theme,
+        appearance: Some(crate::terminal_theme::HostAppearance::Light),
+        appearance_explicit: true,
+    };
+    let encoded = serde_json::to_vec(&applied.to_handoff()).expect("theme should serialize");
+    let carried: crate::server::handoff::HandoffHostTheme =
+        serde_json::from_slice(&encoded).expect("theme should deserialize");
+    assert_eq!(TerminalAttachHostTheme::from_handoff(&carried), applied);
+
+    let mut imported = test_headless_server();
+    imported.restore_handed_off_host_theme(&carried);
+
+    assert_eq!(imported.terminal_attach_host_theme, Some(applied));
+    assert_eq!(imported.app.state.host_terminal_theme, theme);
+    assert_eq!(
+        imported.app.state.host_terminal_appearance,
+        Some(crate::terminal_theme::HostAppearance::Light)
+    );
+    assert!(imported.app.state.host_terminal_appearance_explicit);
 }

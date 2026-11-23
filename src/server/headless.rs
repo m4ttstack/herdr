@@ -165,6 +165,11 @@ const SHUTDOWN_API_TIMEOUT: Duration = Duration::from_secs(5);
 /// otherwise idle. Keep this much slower than the old resize-poll cadence to
 /// avoid reintroducing the idle CPU spin.
 const CLIENT_ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// A `terminal.host_theme` line reaches the server as one update per field,
+/// written back to back. Held agent resumes start only once the theme has
+/// gone this long without another update, so a resumed agent never sees the
+/// background without the foreground of the same line.
+const HOST_THEME_LINE_SETTLE: Duration = Duration::from_millis(25);
 
 // Split shell redraws need several early updates; sustained output still coalesces.
 const INTERACTIVE_RENDER_BUDGET: u8 = 16;
@@ -188,11 +193,76 @@ enum AltScreenReadConflict {
     Defer,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct TerminalAttachHostTheme {
     theme: crate::terminal_theme::TerminalTheme,
     appearance: Option<crate::terminal_theme::HostAppearance>,
     appearance_explicit: bool,
+}
+
+#[cfg(unix)]
+impl TerminalAttachHostTheme {
+    fn to_handoff(self) -> crate::server::handoff::HandoffHostTheme {
+        let rgb = |color: crate::terminal_theme::RgbColor| [color.r, color.g, color.b];
+        crate::server::handoff::HandoffHostTheme {
+            foreground: self.theme.foreground.map(rgb),
+            background: self.theme.background.map(rgb),
+            palette: self
+                .theme
+                .palette
+                .iter()
+                .enumerate()
+                .filter_map(|(index, color)| color.map(|color| (index as u8, rgb(color))))
+                .collect(),
+            appearance: self.appearance.map(|appearance| match appearance {
+                crate::terminal_theme::HostAppearance::Light => {
+                    crate::server::handoff::HandoffHostAppearance::Light
+                }
+                crate::terminal_theme::HostAppearance::Dark => {
+                    crate::server::handoff::HandoffHostAppearance::Dark
+                }
+            }),
+            appearance_explicit: self.appearance_explicit,
+        }
+    }
+
+    fn from_handoff(carried: &crate::server::handoff::HandoffHostTheme) -> Self {
+        let color = |[r, g, b]: [u8; 3]| crate::terminal_theme::RgbColor { r, g, b };
+        let mut theme = crate::terminal_theme::TerminalTheme {
+            foreground: carried.foreground.map(color),
+            background: carried.background.map(color),
+            ..Default::default()
+        };
+        for &(index, rgb) in &carried.palette {
+            theme.palette[usize::from(index)] = Some(color(rgb));
+        }
+        Self {
+            theme,
+            appearance: carried.appearance.map(|appearance| match appearance {
+                crate::server::handoff::HandoffHostAppearance::Light => {
+                    crate::terminal_theme::HostAppearance::Light
+                }
+                crate::server::handoff::HandoffHostAppearance::Dark => {
+                    crate::terminal_theme::HostAppearance::Dark
+                }
+            }),
+            appearance_explicit: carried.appearance_explicit,
+        }
+    }
+}
+
+/// An agent resume held back at terminal attach while the session has no
+/// host theme: started as soon as one arrives, or at `deadline` without one.
+#[derive(Clone)]
+struct ThemeWaitingResume {
+    /// The attach owner key the controller attached under, which can name
+    /// the terminal differently from its id.
+    owner_key: String,
+    rows: u16,
+    cols: u16,
+    cell_width_px: u32,
+    cell_height_px: u32,
+    deadline: Instant,
 }
 
 /// The headless server — runs the herdr event loop without a real terminal.
@@ -218,6 +288,11 @@ pub struct HeadlessServer {
     /// The host theme a terminal controller last set, put back whenever no
     /// foreground client is left to own the session's theme.
     terminal_attach_host_theme: Option<TerminalAttachHostTheme>,
+    /// Keyed by terminal, so a second attach to the same terminal replaces
+    /// the first one's wait rather than starting a second resume.
+    theme_waiting_resumes: HashMap<crate::terminal::TerminalId, ThemeWaitingResume>,
+    /// When the terminal controller's latest theme update has settled.
+    host_theme_settles_at: Option<Instant>,
     /// Ephemeral shell connection controlling PTY geometry for each stable tab id.
     tab_geometry_controllers: HashMap<String, u64>,
     /// Stable tab id whose viewers may see and interact with the one terminal popup.
@@ -375,6 +450,8 @@ impl HeadlessServer {
             next_client_id: 1,
             foreground_client_id: None,
             terminal_attach_host_theme: None,
+            theme_waiting_resumes: HashMap::new(),
+            host_theme_settles_at: None,
             tab_geometry_controllers: HashMap::new(),
             popup_owner_tab_id: None,
             client_shell_boot_id: format!(
@@ -627,6 +704,10 @@ impl HeadlessServer {
                 )
                 .map(|deadline| deadline.min(now + CLIENT_ACCEPT_POLL_INTERVAL))
                 .or(Some(now + CLIENT_ACCEPT_POLL_INTERVAL));
+            let next_deadline = match (next_deadline, self.next_theme_waiting_resume_deadline()) {
+                (Some(current), Some(waiting)) => Some(current.min(waiting)),
+                (current, waiting) => current.or(waiting),
+            };
             let next_deadline = self
                 .pending_alt_screen_reads
                 .iter()
@@ -871,6 +952,77 @@ impl HeadlessServer {
         if let Some(applied) = self.terminal_attach_host_theme {
             self.apply_terminal_attach_host_theme(applied);
         }
+    }
+
+    #[cfg(unix)]
+    fn restore_handed_off_host_theme(
+        &mut self,
+        carried: &crate::server::handoff::HandoffHostTheme,
+    ) {
+        let applied = TerminalAttachHostTheme::from_handoff(carried);
+        self.terminal_attach_host_theme = Some(applied);
+        self.apply_terminal_attach_host_theme(applied);
+    }
+
+    /// Starts every held-back resume once the session has a settled host
+    /// theme, and any whose wait ran out without one. A terminal whose
+    /// controller is still attached resumes at that controller's current size.
+    fn start_theme_waiting_resumes(&mut self, now: Instant) -> bool {
+        if self.theme_waiting_resumes.is_empty() {
+            return false;
+        }
+        let theme_ready = !self.app.state.host_terminal_theme.is_empty()
+            && self
+                .host_theme_settles_at
+                .is_none_or(|settles| now >= settles);
+        let due: Vec<_> = self
+            .theme_waiting_resumes
+            .iter()
+            .filter(|(_, waiting)| theme_ready || now >= waiting.deadline)
+            .map(|(terminal_id, waiting)| (terminal_id.clone(), waiting.clone()))
+            .collect();
+        let mut changed = false;
+        for (terminal_id, mut waiting) in due {
+            self.theme_waiting_resumes.remove(&terminal_id);
+            if let Some(client) = self
+                .terminal_attach_owners
+                .get(&waiting.owner_key)
+                .and_then(|client_id| self.clients.get(client_id))
+            {
+                (waiting.cols, waiting.rows) = client.terminal_size;
+                waiting.cell_width_px = client.cell_size.width_px;
+                waiting.cell_height_px = client.cell_size.height_px;
+            }
+            if self.app.start_pending_agent_resume_for_terminal(
+                &terminal_id,
+                waiting.rows,
+                waiting.cols,
+                true,
+            ) {
+                changed = true;
+                if let Some(runtime) = self.app.terminal_runtimes.get(&terminal_id) {
+                    runtime.resize(
+                        waiting.rows,
+                        waiting.cols,
+                        waiting.cell_width_px,
+                        waiting.cell_height_px,
+                    );
+                }
+            }
+        }
+        changed
+    }
+
+    fn next_theme_waiting_resume_deadline(&self) -> Option<Instant> {
+        let deadline = self
+            .theme_waiting_resumes
+            .values()
+            .map(|waiting| waiting.deadline)
+            .min()?;
+        Some(
+            self.host_theme_settles_at
+                .map_or(deadline, |settles| settles.min(deadline)),
+        )
     }
 
     fn apply_terminal_attach_host_theme(&mut self, applied: TerminalAttachHostTheme) -> bool {
@@ -1860,8 +2012,29 @@ impl HeadlessServer {
             .state
             .direct_attach_resize_locks
             .insert(real_terminal_id.clone());
-        self.app
-            .start_pending_agent_resume_for_terminal(&real_terminal_id, rows, cols, true);
+        // A resume started here would spawn the agent before this client can
+        // send its host theme, which arrives on this same connection only
+        // after the attach; the agent would read its colors from nothing.
+        if self.app.state.host_terminal_theme.is_empty()
+            && self
+                .app
+                .terminal_has_pending_agent_resume(&real_terminal_id)
+        {
+            self.theme_waiting_resumes.insert(
+                real_terminal_id.clone(),
+                ThemeWaitingResume {
+                    owner_key: terminal_id.clone(),
+                    rows,
+                    cols,
+                    cell_width_px: cell_size.width_px,
+                    cell_height_px: cell_size.height_px,
+                    deadline: Instant::now() + app::PENDING_AGENT_RESUME_THEME_WAIT,
+                },
+            );
+        } else {
+            self.app
+                .start_pending_agent_resume_for_terminal(&real_terminal_id, rows, cols, true);
+        }
         if let Some(runtime) = self.app.terminal_runtimes.get(&real_terminal_id) {
             runtime.resize(rows, cols, cell_size.width_px, cell_size.height_px);
         }
@@ -2308,6 +2481,7 @@ impl HeadlessServer {
                         appearance_explicit: client.host_terminal_appearance_explicit,
                     };
                     self.terminal_attach_host_theme = Some(applied);
+                    self.host_theme_settles_at = Some(Instant::now() + HOST_THEME_LINE_SETTLE);
                     return self.apply_terminal_attach_host_theme(applied);
                 }
                 if !matches!(client.mode, ClientConnectionMode::ClientShell) {
@@ -3415,6 +3589,7 @@ impl HeadlessServer {
         }
 
         changed |= self.app.handle_tab_bar_status_tasks(now);
+        changed |= self.start_theme_waiting_resumes(now);
 
         if geometry_dirty {
             self.app.pending_agent_resume_deadline = None;
