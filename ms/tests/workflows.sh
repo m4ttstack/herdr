@@ -89,3 +89,76 @@ ruby -ryaml -e '
     exit 1
   end
 ' "$ROOT/.github/workflows/ms-release.yml" || exit 1
+
+# The nightly's rebase step stops on any failure but the rebase's own exit code,
+# and the issue is written by its own job from a clean checkout, never on the
+# machine that ran upstream's build code.
+ruby -ryaml -e '
+  wf = YAML.load_file(ARGV[0])
+  jobs = wf.fetch("jobs")
+  rebase = jobs.dig("candidate", "steps").find { |s| s["id"] == "rebase" }["run"].to_s
+  fails = []
+  fails << "the rebase step does not run with set -e" unless rebase =~ /^set -[a-z]*e[a-z]* pipefail/
+  fails << "the rebase step does not catch the rebase exit code under set -e" unless rebase =~ %r{ms/rebase-onto\.sh .*\|\| code=\$\?}
+  report = jobs.find { |_, j| (j["steps"] || []).any? { |s| s["name"] == "Open or update the issue" } }
+  if report.nil?
+    fails << "no job opens the issue"
+  else
+    name, job = report
+    fails << "the issue is written in the candidate job, after upstream code ran" if name == "candidate"
+    fails << "the issue job does not wait for the candidate job" unless Array(job["needs"]).include?("candidate")
+    fails << "the issue job runs upstream code" if job["steps"].any? { |s| s.to_yaml =~ /cargo|ms\/tests|rebase-onto/ }
+    step = job["steps"].find { |s| s["name"] == "Open or update the issue" }
+    fails << "the issue step does not run ms/upstream-issue.sh" unless step["run"].to_s.include?("ms/upstream-issue.sh")
+  end
+  fails << "the candidate job can still write issues" if jobs.dig("candidate", "permissions", "issues")
+  if fails.empty?
+    puts "PASS: the nightly stops on failures and reports from a clean job"
+  else
+    fails.each { |f| warn "FAIL #{f}" }
+    exit 1
+  end
+' "$ROOT/.github/workflows/ms-upstream.yml" || exit 1
+
+# A fixed heredoc delimiter in GITHUB_OUTPUT lets output that contains it end
+# the value early and inject outputs of its own.
+ruby -ryaml -e '
+  fails = []
+  ARGV.each do |path|
+    YAML.load_file(path).fetch("jobs").each_value do |job|
+      (job["steps"] || []).each do |s|
+        s["run"].to_s.scan(/<<([^\s"$]+)/).flatten.each do |delim|
+          next if delim.start_with?("\x27", "-")
+          fails << "#{File.basename(path)}: #{s["name"] || s["id"]} ends a multi-line output with the fixed delimiter #{delim}" if s["run"].include?("GITHUB_OUTPUT")
+        end
+      end
+    end
+  end
+  if fails.empty?
+    puts "PASS: multi-line step outputs use a random delimiter"
+  else
+    fails.each { |f| warn "FAIL #{f}" }
+    exit 1
+  end
+' "$ROOT/.github/workflows/ms-upstream.yml" "$ROOT/.github/workflows/ms-release.yml" || exit 1
+
+# A tag can be moved to other code; the fork's workflows pin third-party actions
+# by full commit SHA, with the version in a comment.
+ruby -e '
+  fails = []
+  ARGV.each do |path|
+    File.readlines(path).each_with_index do |line, i|
+      next unless line =~ /^\s*(-\s+)?uses:\s*(\S+)(.*)$/
+      ref, rest = $2, $3
+      next if ref.start_with?("./")
+      fails << "#{File.basename(path)}:#{i + 1} #{ref} is not pinned by a full commit SHA" unless ref =~ /@[0-9a-f]{40}$/
+      fails << "#{File.basename(path)}:#{i + 1} #{ref} has no # vX.Y.Z comment" unless rest =~ /#\s*v\d+\.\d+\.\d+/
+    end
+  end
+  if fails.empty?
+    puts "PASS: third-party actions are pinned by commit SHA"
+  else
+    fails.each { |f| warn "FAIL #{f}" }
+    exit 1
+  end
+' "$ROOT/.github/workflows/ms-upstream.yml" "$ROOT/.github/workflows/ms-release.yml" || exit 1
