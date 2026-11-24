@@ -1,9 +1,13 @@
-#!/bin/bash
+#!/bin/bash -p
 # Signs and notarizes release binaries with the Developer ID key, which only root
 # can read. install.sh installs this root-owned at /usr/local/herdr-signer/sign.sh
 # and lets herdr-signer run it, and nothing else, through sudo -n.
 # Usage: sudo -n /usr/local/herdr-signer/sign.sh /abs/path/in/_work/binary...
 set -euo pipefail
+
+# Root runs this for the caller, and macOS's sudo keeps the caller's PATH and
+# HOME; -p above ignores BASH_ENV and functions from the environment.
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
 
 CALLER=herdr-signer
 WORK_DIR=/Users/$CALLER/runner/_work
@@ -48,6 +52,15 @@ is_macho() { # is_macho <file>: thin or fat Mach-O magic
   esac
 }
 
+# rcodesign reads rcodesign.toml from the home and current directories, and
+# RCODESIGN_ variables, which can name any file for it to read or embed. Run it
+# with an empty environment, in the scratch directory, with no config file.
+rcodesign() { # rcodesign <command> <args>...
+  local command="$1"; shift
+  (cd "$SCRATCH" && exec /usr/bin/env -i PATH="$PATH" HOME="$SCRATCH" TMPDIR="$SCRATCH" \
+    "$RCODESIGN" "$command" --config-file /dev/null "$@")
+}
+
 SCRATCH="$(mktemp -d -t herdr-sign)"
 trap 'rm -rf "$SCRATCH"' EXIT
 
@@ -65,12 +78,12 @@ i=0
 for path in "$@"; do
   i=$((i + 1))
   copy="$SCRATCH/$i/$(basename "$path")"
-  "$RCODESIGN" sign --p12-file "$KEY_DIR/developer-id.p12" --p12-password-file "$KEY_DIR/p12-password" \
+  rcodesign sign --p12-file "$KEY_DIR/developer-id.p12" --p12-password-file "$KEY_DIR/p12-password" \
     --code-signature-flags runtime --timestamp-url "$TIMESTAMP_URL" "$copy" \
     || refuse "rcodesign could not sign $path"
   # Apple's notary service takes no bare Mach-O, only a zip of one.
   ditto -c -k --norsrc --noextattr --noqtn --noacl "$copy" "$copy.zip"
-  "$RCODESIGN" notary-submit --api-key-file "$KEY_DIR/notary-api-key.json" --wait "$copy.zip" \
+  rcodesign notary-submit --api-key-file "$KEY_DIR/notary-api-key.json" --wait "$copy.zip" \
     || refuse "Apple did not notarize $path"
 done
 

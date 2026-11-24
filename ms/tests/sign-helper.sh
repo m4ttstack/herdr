@@ -24,19 +24,24 @@ printf '{"issuer_id":"i","key_id":"k","private_key":"p"}' > "$KEYS/notary-api-ke
 
 # The stub signs by appending a marker, after proving it was handed the key and
 # a password that opens it; notary-submit checks the zip holds a signed file.
+# The helper hands it no environment, so its knobs are files beside it.
 cat > "$TMP/bin/rcodesign" <<'STUB'
 #!/bin/bash
+ME="$(dirname "$0")"
+. "$ME/stub.env"
 echo "$*" >> "$STUB_LOG"
+{ echo "cwd=$PWD"; env; } > "$ME/seen"
+case "$*" in *"--config-file /dev/null"*) ;; *) echo "stub: would load config files" >> "$STUB_LOG" ;; esac
 cmd="$1"; shift
 case "$cmd" in
   sign)
-    [ -z "${STUB_FAIL_SIGN:-}" ] || exit 1
+    [ ! -e "$ME/fail-sign" ] || exit 1
     p12=""; pw=""; target=""
     while [ $# -gt 0 ]; do
       case "$1" in
         --p12-file) p12="$2"; shift 2 ;;
         --p12-password-file) pw="$2"; shift 2 ;;
-        --code-signature-flags|--timestamp-url) shift 2 ;;
+        --code-signature-flags|--timestamp-url|--config-file) shift 2 ;;
         *) target="$1"; shift ;;
       esac
     done
@@ -44,7 +49,7 @@ case "$cmd" in
     echo "signed-path $target" >> "$STUB_LOG"
     printf 'SIGNED' >> "$target" ;;
   notary-submit)
-    [ -z "${STUB_FAIL_NOTARY:-}" ] || exit 1
+    [ ! -e "$ME/fail-notary" ] || exit 1
     zip="${*: -1}"
     unzip -p "$zip" | tail -c 6 | grep -qx SIGNED || { echo "stub: zip holds no signed file" >&2; exit 1; }
     echo "notarized" >> "$STUB_LOG" ;;
@@ -53,10 +58,10 @@ esac
 STUB
 chmod 755 "$TMP/bin/rcodesign"
 
-export STUB_LOG="$LOG"
+printf 'STUB_LOG=%q\nPATH=%q\n' "$LOG" "$PATH" > "$TMP/bin/stub.env"
 run() {
   HERDR_SIGNER_WORK_DIR="$WORK" HERDR_SIGNER_KEY_DIR="$KEYS" HERDR_SIGNER_RCODESIGN="$TMP/bin/rcodesign" \
-    bash "$HELPER" "$@"
+    "$HELPER" "$@"
 }
 fresh() { # fresh <path>: a Mach-O copy of /usr/bin/true
   cp /usr/bin/true "$1"; chmod 755 "$1"; : > "$LOG"
@@ -77,7 +82,7 @@ case "$SIGNED_PATH" in
   "$WORK"/*|"$(cd "$WORK" && pwd -P)"/*|"") bad "signs a copy outside _work, not the file itself (signed $SIGNED_PATH)" ;;
   *) ok "signs a copy outside _work, not the file itself" ;;
 esac
-grep -q -- "notary-submit --api-key-file $KEYS/notary-api-key.json --wait " "$LOG" && ok "notarizes with the root-only API key and waits" || bad "notarizes with the root-only API key and waits"
+grep -q -- "notary-submit --config-file /dev/null --api-key-file $KEYS/notary-api-key.json --wait " "$LOG" && ok "notarizes with the root-only API key and waits" || bad "notarizes with the root-only API key and waits"
 grep -qx notarized "$LOG" && ok "notarizes the signed file" || bad "notarizes the signed file"
 
 # Two files in one call.
@@ -108,10 +113,27 @@ refuses "a refused file among good ones, before signing any" "not a Mach-O" "$BI
 
 # A failed signing or notarization leaves the file as it was.
 fresh "$BIN"; BEFORE="$(shasum -a 256 < "$BIN")"
-STUB_FAIL_SIGN=1 run "$BIN" >/dev/null 2>&1; CODE=$?
+touch "$TMP/bin/fail-sign"; run "$BIN" >/dev/null 2>&1; CODE=$?; rm -f "$TMP/bin/fail-sign"
 [ "$CODE" -ne 0 ] && [ "$(shasum -a 256 < "$BIN")" = "$BEFORE" ] && ok "a failed signing leaves the file unchanged" || bad "a failed signing leaves the file unchanged"
-STUB_FAIL_NOTARY=1 run "$BIN" >/dev/null 2>&1; CODE=$?
+touch "$TMP/bin/fail-notary"; run "$BIN" >/dev/null 2>&1; CODE=$?; rm -f "$TMP/bin/fail-notary"
 [ "$CODE" -ne 0 ] && [ "$(shasum -a 256 < "$BIN")" = "$BEFORE" ] && ok "a failed notarization leaves the file unchanged" || bad "a failed notarization leaves the file unchanged"
+
+# macOS's sudo keeps the caller's PATH and HOME, so the helper must not run the
+# caller's commands, and rcodesign must not read the caller's config files.
+mkdir -p "$TMP/evil" "$TMP/evilhome/.config/rcodesign"
+for tool in id test sh cat od tr mktemp mkdir basename dirname ditto rm env sudo; do
+  printf '#!/bin/bash\necho %s >> %q\nexec /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin %s "$@"\n' "$tool" "$TMP/planted" "$tool" > "$TMP/evil/$tool"
+done
+chmod 755 "$TMP/evil"/*
+printf 'echo BASH_ENV >> %q\n' "$TMP/planted" > "$TMP/evil.bashrc"
+fresh "$BIN"
+(cd "$TMP/evilhome" && PATH="$TMP/evil:$PATH" HOME="$TMP/evilhome" BASH_ENV="$TMP/evil.bashrc" \
+  RCODESIGN_PLANTED=1 run "$BIN" >/dev/null 2>&1); CODE=$?
+[ "$CODE" -eq 0 ] && ok "signs under a hostile environment" || bad "signs under a hostile environment (exit $CODE)"
+[ ! -e "$TMP/planted" ] && ok "runs nothing from the caller's PATH or BASH_ENV" || bad "runs nothing from the caller's PATH or BASH_ENV (ran: $(sort -u "$TMP/planted" | tr '\n' ' '))"
+grep -q 'evil' "$TMP/bin/seen" && bad "rcodesign gets none of the caller's HOME, PATH or directory ($(grep evil "$TMP/bin/seen" | tr '\n' ' '))" || ok "rcodesign gets none of the caller's HOME, PATH or directory"
+grep -q '^RCODESIGN_' "$TMP/bin/seen" && bad "rcodesign gets no RCODESIGN_ settings from the caller" || ok "rcodesign gets no RCODESIGN_ settings from the caller"
+grep -q 'would load config files' "$LOG" && bad "rcodesign loads no config file" || ok "rcodesign loads no config file"
 
 run >/dev/null 2>&1; CODE=$?
 [ "$CODE" -eq 2 ] && ok "no file is a usage error" || bad "no file is a usage error (got $CODE)"
