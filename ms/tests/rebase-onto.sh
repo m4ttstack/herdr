@@ -117,5 +117,14 @@ ERR="$(cd "$REPO" && STUB_FAIL_FIXUP=1 PATH="$STUBS:$PATH" "$SCRIPT" v1.0.3 2>&1
 if [ "$CODE" -eq 4 ]; then ok "a failed README commit exits 4"; else bad "a failed README commit exits 4 (got $CODE: $ERR)"; fi
 clean_on "a failed README commit" mattstack/1.0.3 mattstack/1.0.0
 
+# A rebase already in progress is yours, not this script's to undo.
+g switch -q -f mattstack/1.0.0
+g rebase -q --exec false v1.0.0 >/dev/null 2>&1
+BEFORE="$(g rev-parse HEAD)"
+(cd "$REPO" && "$SCRIPT" v1.0.4 >/dev/null 2>&1); CODE=$?
+if [ "$CODE" -eq 2 ] && [ -d "$REPO/.git/rebase-merge" ] && [ "$(g rev-parse HEAD)" = "$BEFORE" ]; then ok "refuses during a rebase and leaves it alone"
+else bad "refuses during a rebase and leaves it alone (got $CODE)"; fi
+g rebase --abort
+
 [ "$FAILS" -eq 0 ] || { echo "rebase-onto.sh: $FAILS check(s) failed" >&2; exit 1; }
 echo "PASS: rebase-onto"
