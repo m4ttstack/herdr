@@ -55,21 +55,21 @@ jobs:
             echo "newest=$newest"
           } >> "$GITHUB_OUTPUT"
 
-  # Runs upstream's build and test code, so no token reaches those steps:
-  # credentials stay out of .git/config and only the push step gets one.
+  # Runs upstream's build and test code, so this job gets no token: that code
+  # could leave a hook or a tool behind for a later step here.
   candidate:
     needs: find
     if: needs.find.outputs.action == 'rebase'
     runs-on: macos-latest
     timeout-minutes: 120
     permissions:
-      contents: write
+      contents: read
     outputs:
       code: ${{ steps.rebase.outputs.code }}
+      tree: ${{ steps.rebase.outputs.tree }}
       detail: ${{ steps.rebase.outputs.detail }}
       failed: ${{ steps.test.outputs.failed }}
       test_outcome: ${{ steps.test.outcome }}
-      pushed: ${{ steps.push.outputs.pushed }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -92,8 +92,11 @@ jobs:
           ms/rebase-onto.sh "v$NEWEST" 2> rebase.err || code=$?
           cat rebase.err >&2
           delimiter="ms-upstream-$(openssl rand -hex 16)"
+          tree=""
+          [ "$code" != 0 ] || tree="$(git rev-parse "mattstack/$NEWEST^{tree}")"
           {
             echo "code=$code"
+            echo "tree=$tree"
             echo "detail<<$delimiter"
             cat rebase.err
             echo "$delimiter"
@@ -123,9 +126,41 @@ jobs:
           done
           echo "failed=$failed" >> "$GITHUB_OUTPUT"
 
+  # On a fresh machine, where no upstream code has run: rebases again and pushes
+  # only the tree the candidate job tested.
+  push:
+    needs: [find, candidate]
+    if: needs.candidate.outputs.code == '0' && needs.candidate.outputs.test_outcome == 'success' && needs.candidate.outputs.failed == ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      pushed: ${{ steps.push.outputs.pushed }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Rebase onto the new release
+        env:
+          SOURCE: ${{ needs.find.outputs.source }}
+          CURRENT: ${{ needs.find.outputs.current }}
+          NEWEST: ${{ needs.find.outputs.newest }}
+          TESTED_TREE: ${{ needs.candidate.outputs.tree }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git fetch -q --no-tags "$UPSTREAM" "refs/tags/v$CURRENT:refs/tags/v$CURRENT" "refs/tags/v$NEWEST:refs/tags/v$NEWEST"
+          git switch -q "$SOURCE"
+          ms/rebase-onto.sh "v$NEWEST"
+          tree="$(git rev-parse "mattstack/$NEWEST^{tree}")"
+          [ "$tree" = "$TESTED_TREE" ] || { echo "::error::this rebase gave tree $tree, but the candidate job tested $TESTED_TREE"; exit 1; }
+
       - name: Push the candidate branch
         id: push
-        if: steps.rebase.outputs.code == '0' && steps.test.outputs.failed == ''
         env:
           # The default token cannot push a branch whose new upstream commits
           # change .github/workflows. MS_PUSH_TOKEN: a fine-grained token for
@@ -144,7 +179,7 @@ jobs:
   # On a fresh machine from the fork's own branch: the candidate job's machine
   # ran upstream's build code, which could have changed any file or tool there.
   report:
-    needs: [find, candidate]
+    needs: [find, candidate, push]
     if: always() && needs.find.outputs.action == 'rebase'
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -166,6 +201,6 @@ jobs:
           REBASE_DETAIL: ${{ needs.candidate.outputs.detail }}
           FAILED: ${{ needs.candidate.outputs.failed }}
           TEST_OUTCOME: ${{ needs.candidate.outputs.test_outcome }}
-          PUSHED: ${{ needs.candidate.outputs.pushed }}
+          PUSHED: ${{ needs.push.outputs.pushed }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: ms/upstream-issue.sh

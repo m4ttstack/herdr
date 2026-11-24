@@ -112,6 +112,20 @@ ruby -ryaml -e '
     fails << "the issue step does not run ms/upstream-issue.sh" unless step["run"].to_s.include?("ms/upstream-issue.sh")
   end
   fails << "the candidate job can still write issues" if jobs.dig("candidate", "permissions", "issues")
+  candidate = jobs.fetch("candidate")
+  fails << "the candidate job can write to the repo" unless candidate["permissions"] == { "contents" => "read" }
+  fails << "the candidate job gets a token" if candidate["steps"].any? { |s| s.to_yaml =~ /secrets\.|github\.token/ }
+  push = jobs["push"]
+  if push.nil?
+    fails << "no push job pushes the candidate branch"
+  else
+    fails << "the push job does not wait for the candidate job" unless Array(push["needs"]).include?("candidate")
+    fails << "the push job runs when the candidate tests did not pass" unless push["if"].to_s =~ /candidate\.outputs\.test_outcome == .success./ && push["if"].to_s =~ /candidate\.outputs\.failed == ../
+    fails << "the push job builds or tests upstream code" if push["steps"].any? { |s| s.to_yaml =~ /cargo|ms\/tests|setup-zig|install-action|download-artifact/ }
+    fails << "the push job does not rebase for itself" unless push["steps"].any? { |s| s["run"].to_s.include?("ms/rebase-onto.sh") }
+    fails << "the push job does not check it pushes the tested tree" unless push.to_yaml.include?("needs.candidate.outputs.tree")
+    fails << "the issue job does not wait for the push job" if report && !Array(report[1]["needs"]).include?("push")
+  end
   if fails.empty?
     puts "PASS: the nightly stops on failures and reports from a clean job"
   else
