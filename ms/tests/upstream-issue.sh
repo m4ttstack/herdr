@@ -14,7 +14,7 @@ bad() { echo "FAIL $1" >&2; FAILS=$((FAILS + 1)); }
 mkdir -p "$TMP/bin"
 cat > "$TMP/bin/gh" <<'STUB'
 #!/bin/bash
-if [ "$1 $2" = "issue list" ]; then cat "$STUB_ISSUES"; exit 0; fi
+if [ "$1 $2" = "issue list" ]; then case "$*" in *"--state all"*) cat "$STUB_ISSUES" ;; *) jq "map(select(.state == \"OPEN\"))" "$STUB_ISSUES" ;; esac; exit 0; fi
 { printf '%s' "$1 $2"; shift 2; for a in "$@"; do printf ' [%s]' "$a"; done; echo; } >> "$STUB_LOG"
 STUB
 chmod 755 "$TMP/bin/gh"
@@ -27,8 +27,8 @@ night() { # night <issues json> <env assignments>...: one run of the issue step
     CURRENT=0.9.5 NEWEST=0.9.6 RUN_URL=https://example.invalid/run REBASE_CODE= REBASE_DETAIL= \
     FAILED= TEST_OUTCOME= PUSHED= "$@" bash "$SCRIPT" >/dev/null 2>"$TMP/err" || { bad "the script exits 0 ($(cat "$TMP/err"))"; return 1; }
 }
-issue() { # issue <number> <title> <state>: an open labelled issue for 0.9.6
-  printf '{"number":%s,"title":"%s","body":"old body\\n\\n<!-- ms-upstream v0.9.6 state=%s -->"}' "$1" "$2" "$3"
+issue() { # issue <number> <title> <outcome> [OPEN|CLOSED]: a labelled issue for 0.9.6
+  printf '{"number":%s,"title":"%s","state":"'"${4:-OPEN}"'","body":"old body\\n\\n<!-- ms-upstream v0.9.6 state=%s -->"}' "$1" "$2" "$3"
 }
 has() { grep -qF -- "$2" "$STUB_LOG" && ok "$1" || bad "$1 (gh calls: $(cat "$STUB_LOG"))"; }
 lacks() { grep -qF -- "$2" "$STUB_LOG" && bad "$1 (gh calls: $(cat "$STUB_LOG"))" || ok "$1"; }
@@ -62,7 +62,7 @@ has "a pushed branch gives the publish command" "gh workflow run ms-release.yml 
 lacks "a retitled issue gets no twin" "issue create"
 
 # Another version's issue is not this one.
-night '[{"number":3,"title":"herdr 0.9.6 needs a hand","body":"<!-- ms-upstream v0.9.5 state=conflict -->"}]' REBASE_CODE=0 TEST_OUTCOME=success FAILED=ms/tests/x.sh
+night '[{"number":3,"state":"OPEN","title":"herdr 0.9.6 needs a hand","body":"<!-- ms-upstream v0.9.5 state=conflict -->"}]' REBASE_CODE=0 TEST_OUTCOME=success FAILED=ms/tests/x.sh
 has "an issue for another version is left alone" "issue create"
 lacks "an issue for another version is not edited" "issue edit [3]"
 has "failed tests are named" "ms/tests/x.sh"
@@ -83,6 +83,23 @@ night '[]'
 has "a candidate with no rebase result is marked incomplete" "state=incomplete"
 has "a candidate with no rebase result needs a hand" "[herdr 0.9.6 needs a hand]"
 lacks "a candidate with no rebase result is not called a rebase failure" "The rebase failed"
+
+# Tests passed but the push job never reported: nothing may say to publish.
+night '[]' REBASE_CODE=0 TEST_OUTCOME=success PUSHED=
+has "a push job that failed is marked" "state=pushfailed"
+has "a push job that failed needs a hand" "[herdr 0.9.6 needs a hand]"
+lacks "a push job that failed gives no publish command" "gh workflow run"
+
+# A closed issue stays closed while nothing changes, and reopens when it does.
+night "[$(issue 7 "herdr 0.9.6 needs a hand" conflict CLOSED)]" REBASE_CODE=3 REBASE_DETAIL=x
+[ ! -s "$STUB_LOG" ] && ok "a closed issue with the same outcome stays closed" || bad "a closed issue with the same outcome stays closed (gh calls: $(cat "$STUB_LOG"))"
+night "[$(issue 7 "herdr 0.9.6 needs a hand" conflict CLOSED)]" REBASE_CODE=0 TEST_OUTCOME=success PUSHED=yes
+has "a closed issue reopens on a new outcome" "issue reopen [7]"
+has "a reopened issue is updated" "issue edit [7]"
+lacks "a reopened issue gets no twin" "issue create"
+night "[$(issue 8 "newer" conflict CLOSED),$(issue 7 "older" tests OPEN)]" REBASE_CODE=0 TEST_OUTCOME=success PUSHED=yes
+has "an open issue wins over a closed one" "issue edit [7]"
+lacks "an open issue is not reopened" "issue reopen"
 
 [ "$FAILS" -eq 0 ] || { echo "upstream-issue: $FAILS check(s) failed" >&2; exit 1; }
 echo "PASS: one issue per upstream version, updated only when the outcome changes"
