@@ -47,3 +47,15 @@ ruby -ryaml -e '
     exit 1
   end
 ' "$ROOT/.github/workflows/ms-release.yml" "$ROOT/ms/runner/install.sh" || exit 1
+
+# A launchd runner's user starts with an empty keychain search list, and
+# codesign cannot find the identity's key outside that list.
+ruby -ryaml -e '
+  sign = YAML.load_file(ARGV[0]).dig("jobs", "release", "steps").find { |s| s["name"] == "Sign" }["run"]
+  if sign =~ /security list-keychains -d user -s "\$HERDR_SIGNING_KEYCHAIN"/
+    puts "PASS: the Sign step puts the signing keychain on the search list"
+  else
+    warn "FAIL the Sign step leaves the signing keychain off the user search list"
+    exit 1
+  end
+' "$ROOT/.github/workflows/ms-release.yml" || exit 1

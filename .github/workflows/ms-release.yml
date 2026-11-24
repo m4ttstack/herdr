@@ -80,6 +80,10 @@ jobs:
           set -euo pipefail
           : "${HERDR_SIGNING_KEYCHAIN:?the runner has no signing keychain; see ms/runner/README.md}"
           security unlock-keychain -p "$(cat "$HERDR_SIGNING_KEYCHAIN_PASSWORD_FILE")" "$HERDR_SIGNING_KEYCHAIN"
+          # A launchd runner's user starts with an empty search list, and codesign
+          # finds the identity's private key only through that list.
+          security list-keychains -d user -s "$HERDR_SIGNING_KEYCHAIN"
+          security default-keychain -d user -s "$HERDR_SIGNING_KEYCHAIN"
           # codesign builds the chain from keychains only, never online.
           for cer in ms/runner/apple/*.cer; do
             out="$(security import "$cer" -k "$HERDR_SIGNING_KEYCHAIN" 2>&1)" || case "$out" in
