@@ -49,6 +49,7 @@ sudo() { case "$*" in "-u herdr-signer test -x"*) return 1 ;; esac; :; }
 zig() { echo 0.16.0; }
 for tool in curl shasum tar gh jq launchctl security visudo sleep; do eval "$tool() { :; }"; done
 id() { echo 501; }
+scutil() { echo Test-Mac; }
 seen_path() { [ "$PATH" = "${SEEN_PATH:-}" ] || { SEEN_PATH="$PATH"; printf '%s\n' "$PATH" >> "$PATH_LOG"; }; }
 set -T
 trap seen_path DEBUG
@@ -80,7 +81,7 @@ cmd="$1"; shift
 p12=""; pw=""; out=""
 while [ $# -gt 0 ]; do case "$1" in --p12-file) p12="$2"; shift ;; --p12-password-file) pw="$2"; shift ;; -o) out="$2"; shift ;; esac; shift; done
 case "$cmd" in
-  sign) [ "$(cat "$p12"):$(cat "$pw")" = "p12:pw" ] ;;
+  sign) [ "$(cat "$p12"):$(cat "$pw")" = "p12:pw" ] || { echo "Error: incorrect password given when decrypting PFX data" >&2; exit 1; } ;;
   encode-app-store-connect-api-key) echo '{}' > "$out" ;;
 esac
 STUB
@@ -118,6 +119,7 @@ printf p12 > "$TMP/new.p12"
 reset_keys; mkdir -p "$KEYS"; printf kept > "$KEYS/developer-id.p12"; printf keptpw > "$KEYS/p12-password"
 keys $'wrong\n' "$TMP/new.p12"; CODE=$?
 check "a mistyped .p12 password changes nothing" '[ $CODE -ne 0 ] && key_is kept:keptpw && [ -e "$OLD" ] && [ -z "$(ls "$KEYS" | grep new)" ]'
+check "a refused .p12 says why and how to convert it" 'grep -q "incorrect password given" "$TMP/keys.out" && grep -q -- "-legacy" "$TMP/keys.out"'
 keys $'pw\n' "$TMP/new.p12"; CODE=$?
 check "a new .p12 replaces the installed one" '[ $CODE -eq 0 ] && key_is p12:pw'
 
