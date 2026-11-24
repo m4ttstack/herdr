@@ -78,6 +78,9 @@ DIR=$CI_HOME/runner
 LABEL=dev.mattstack.herdr-signer
 PLIST=/Library/LaunchDaemons/$LABEL.plist
 TOOL_PATH=$CI_HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+# This script's own PATH. Build code can write $CI_HOME, so nothing run here, as
+# an admin with sudo, may be looked up in it.
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin
 
 [ "$(id -u)" != 0 ] || { echo "Run this as yourself, not root." >&2; exit 1; }
 [ -f ms/runner/job-started.sh ] || { echo "Run this from the repo root." >&2; exit 1; }
@@ -85,17 +88,26 @@ if [ -z "$REGISTRATION_TOKEN" ]; then
   command -v gh >/dev/null || { echo "Install gh and run gh auth login first, or pass --registration-token." >&2; exit 1; }
   gh auth status --hostname github.com >/dev/null
 fi
-# Release jobs run as $CI_USER with only $TOOL_PATH, so the tools must be there,
-# not in your home.
+# Release jobs run as $CI_USER, so the tools must be where it can find them, not
+# in your home.
 for tool in gh jq zig; do
-  PATH="$TOOL_PATH" command -v "$tool" >/dev/null || {
+  command -v "$tool" >/dev/null || {
     echo "Release jobs need $tool in /usr/local/bin or /opt/homebrew/bin (see ms/runner/README.md)." >&2; exit 1; }
 done
-[ "$(PATH="$TOOL_PATH" zig version)" = "$ZIG_VERSION" ] || {
-  echo "zig in /usr/local/bin or /opt/homebrew/bin is $(PATH="$TOOL_PATH" zig version); herdr's build needs $ZIG_VERSION." >&2; exit 1; }
-PATH="$TOOL_PATH:$PATH"
+[ "$(zig version)" = "$ZIG_VERSION" ] || {
+  echo "zig in /usr/local/bin or /opt/homebrew/bin is $(zig version); herdr's build needs $ZIG_VERSION." >&2; exit 1; }
 
 sudo -v
+
+# Before anything runs as the runner user: the drop-in keeps its programs off this
+# terminal. A drop-in that fails to parse would break sudo for everyone on this Mac.
+visudo -cf ms/runner/sudoers
+sudo install -o root -g wheel -m 440 ms/runner/sudoers /etc/sudoers.d/herdr-signer
+if ! sudo visudo -c >/dev/null; then
+  sudo rm -f /etc/sudoers.d/herdr-signer
+  echo "sudo refused its configuration with the herdr-signer drop-in, so it is removed again." >&2
+  exit 1
+fi
 
 if ! id "$CI_USER" >/dev/null 2>&1; then
   sudo sysadminctl -addUser "$CI_USER" -fullName "herdr signer" -home "$CI_HOME" -password "$(openssl rand -base64 24)"
@@ -124,15 +136,6 @@ tar -xzf "$RCODESIGN_TARBALL" -C "$RCODESIGN_DIR"
 sudo install -o root -g wheel -m 755 "$RCODESIGN_DIR/apple-codesign-$RCODESIGN_VERSION-macos-universal/rcodesign" "$HOOK_DIR/rcodesign"
 rm -rf "$RCODESIGN_TARBALL" "$RCODESIGN_DIR"
 
-# A drop-in that fails to parse would break sudo for everyone on this Mac.
-visudo -cf ms/runner/sudoers
-sudo install -o root -g wheel -m 440 ms/runner/sudoers /etc/sudoers.d/herdr-signer
-if ! sudo visudo -c >/dev/null; then
-  sudo rm -f /etc/sudoers.d/herdr-signer
-  echo "sudo refused its configuration with the herdr-signer drop-in, so it is removed again." >&2
-  exit 1
-fi
-
 # The runner user's commands below cannot start from a directory in your home.
 REPO_ROOT=$PWD
 cd /
@@ -147,20 +150,38 @@ sudo -u "$CI_USER" -H bash -c '
 # The helper signs with rcodesign from the .p12 file, since a launchd daemon runs
 # outside any user session, where macOS refuses keychain signing.
 sudo install -d -o root -g wheel -m 700 "$KEY_DIR"
+has_signing_key() { sudo test -f "$KEY_DIR/developer-id.p12" && sudo test -f "$KEY_DIR/p12-password"; }
+STAGED=""
 if [ -n "$P12" ]; then
   read -r -s -p "Password of $P12: " P12_PASSWORD
   echo
-  sudo install -o root -g wheel -m 600 "$P12" "$KEY_DIR/developer-id.p12"
-  printf '%s' "$P12_PASSWORD" | sudo sh -c 'umask 077; cat > "$1"' _ "$KEY_DIR/p12-password"
-elif sudo test -f "$OLD_SIGNING_DIR/developer-id.p12" && ! sudo test -f "$KEY_DIR/developer-id.p12"; then
+  sudo install -o root -g wheel -m 600 "$P12" "$KEY_DIR/developer-id.p12.new"
+  printf '%s' "$P12_PASSWORD" | sudo sh -c 'umask 077; cat > "$1"' _ "$KEY_DIR/p12-password.new"
+  STAGED=yes
+elif ! has_signing_key && sudo test -f "$OLD_SIGNING_DIR/developer-id.p12"; then
   # An older install kept the key in the runner user's home, where build code
   # could swap a file for a link: read as that user, never move as root.
   for file in developer-id.p12 p12-password; do
     sudo -u "$CI_USER" cat "$OLD_SIGNING_DIR/$file" | sudo sh -c 'umask 077; cat > "$1"' _ "$KEY_DIR/$file.new"
   done
-  # The .p12 goes last: its presence is what marks the migration done.
+  STAGED=yes
+fi
+if [ -n "$STAGED" ]; then
+  # A wrong password must not replace a working pair: sign a scratch file first.
+  PROBE=$(mktemp -d /tmp/herdr-signer-probe.XXXXXX)
+  cp /usr/bin/true "$PROBE/probe"
+  if ! sudo "$HOOK_DIR/rcodesign" sign --config-file /dev/null --p12-file "$KEY_DIR/developer-id.p12.new" \
+      --p12-password-file "$KEY_DIR/p12-password.new" --timestamp-url none "$PROBE/probe" >/dev/null 2>&1; then
+    sudo rm -rf "$PROBE"
+    sudo rm -f "$KEY_DIR/developer-id.p12.new" "$KEY_DIR/p12-password.new"
+    echo "rcodesign cannot sign with that .p12 and password; the runner's key is unchanged." >&2
+    exit 1
+  fi
+  sudo rm -rf "$PROBE"
   for file in p12-password developer-id.p12; do sudo mv "$KEY_DIR/$file.new" "$KEY_DIR/$file"; done
 fi
+has_signing_key || {
+  echo "The runner has no signing key yet: pass --p12 (see ms/runner/README.md)." >&2; exit 1; }
 sudo rm -rf "$OLD_SIGNING_DIR"
 if [ -n "$NOTARY_KEY" ]; then
   sudo "$HOOK_DIR/rcodesign" encode-app-store-connect-api-key -o "$KEY_DIR/notary-api-key.json" \
