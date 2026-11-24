@@ -49,7 +49,9 @@ For each path the helper:
    Mach-O binary; it checks every path before it signs any;
 2. copies the file into a root-owned temporary directory, reading it as
    `herdr-signer`, so it never reads a file that user could not;
-3. signs the copy with hardened runtime and Apple's timestamp server;
+3. signs the copy with hardened runtime and Apple's timestamp server.
+   rcodesign gets an empty environment and no config file, and the helper pins
+   its own `PATH`, because macOS's sudo keeps the caller's `PATH` and `HOME`;
 4. zips it (Apple's notary service takes no bare Mach-O) and submits it with
    `rcodesign notary-submit --wait`, which waits for Apple's verdict;
 5. once every file is signed and notarized, writes each back over its path,
@@ -160,6 +162,10 @@ turn it back on:
 gh workflow enable ms-upstream.yml -R m4ttstack/herdr
 gh workflow run ms-upstream.yml -R m4ttstack/herdr
 ```
+
+The job that runs upstream's build and test code gets no token. A second job, on
+a fresh machine, rebases again and pushes only if it gets the tree that was
+tested.
 
 The nightly keeps one issue per upstream version, labelled `ms-upstream` and
 marked in its body. It opens the issue the first night, edits and comments on
