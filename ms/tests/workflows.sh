@@ -48,14 +48,20 @@ ruby -ryaml -e '
   end
 ' "$ROOT/.github/workflows/ms-release.yml" "$ROOT/ms/runner/install.sh" || exit 1
 
-# A launchd runner's user starts with an empty keychain search list, and
-# codesign cannot find the identity's key outside that list.
+# A launchd daemon runs outside any user session, where macOS refuses keychain
+# signing, so the release signs with a pinned rcodesign and the .p12 file.
 ruby -ryaml -e '
-  sign = YAML.load_file(ARGV[0]).dig("jobs", "release", "steps").find { |s| s["name"] == "Sign" }["run"]
-  if sign =~ /security list-keychains -d user -s "\$HERDR_SIGNING_KEYCHAIN"/
-    puts "PASS: the Sign step puts the signing keychain on the search list"
+  steps = YAML.load_file(ARGV[0]).dig("jobs", "release", "steps")
+  sign = steps.find { |s| s["name"] == "Sign" }["run"]
+  fails = []
+  fails << "the Sign step does not check rcodesign against a pinned sha256" unless sign =~ /apple-codesign-[0-9.]+-macos-universal\.tar\.gz/ && sign =~ /[0-9a-f]{64}  .*shasum -a 256 -c|shasum -a 256 -c/ && sign =~ /[0-9a-f]{64}/
+  fails << "the Sign step does not sign with hardened runtime" unless sign =~ /--code-signature-flags runtime/
+  fails << "the Sign step does not read the .p12 file" unless sign.include?("$HERDR_SIGNING_P12") && sign.include?("$HERDR_SIGNING_P12_PASSWORD_FILE")
+  fails << "a release step still uses the keychain" if steps.any? { |s| s["run"].to_s =~ /security |codesign --force|KEYCHAIN/ }
+  if fails.empty?
+    puts "PASS: the Sign step signs with a pinned rcodesign and the .p12 file"
   else
-    warn "FAIL the Sign step leaves the signing keychain off the user search list"
+    fails.each { |f| warn "FAIL #{f}" }
     exit 1
   end
 ' "$ROOT/.github/workflows/ms-release.yml" || exit 1

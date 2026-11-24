@@ -1,24 +1,26 @@
 # The herdr-signer runner
 
 `ms-release.yml` builds and signs fork releases on one self-hosted Mac runner,
-labelled `herdr-signer`. The Developer ID Application certificate lives only in
-that Mac's keychain; it is never a GitHub secret.
+labelled `herdr-signer`. The Developer ID Application certificate lives only on
+that Mac, as a `.p12` file only the runner's user can read; it is never a GitHub
+secret.
 
 ## What the install sets up
 
 `ms/runner/install.sh`:
 
 - creates a hidden `herdr-signer` macOS user, separate from mattstack's CI user,
-  because every job a runner takes can read its user's keychains;
+  because every job a runner takes can read its user's files;
 - installs a root-owned job-started hook (`ms/runner/job-started.sh`) that
   refuses every job except a manual `ms-release.yml` run on a `mattstack/*`
   branch of `m4ttstack/herdr`;
 - installs rustup and the `aarch64-apple-darwin` and `x86_64-apple-darwin`
   targets for that user;
-- creates `~herdr-signer/Library/Keychains/herdr-signing.keychain-db` with a
-  random password kept in `~herdr-signer/.herdr-signing/keychain-password`
-  (mode 600), imports the certificate, and lets `codesign` use the key without
-  a prompt;
+- copies the `.p12` to `~herdr-signer/.herdr-signing/developer-id.p12` and its
+  password to `~herdr-signer/.herdr-signing/p12-password` (both mode 600);
+  release jobs sign with a pinned [rcodesign](https://github.com/indygreg/apple-platform-rs)
+  from that file, because the runner is a launchd daemon outside any user
+  session, where macOS refuses keychain signing;
 - registers runner `herdr-signer-<LocalHostName>` with the single label
   `herdr-signer`, run by launchd (`dev.mattstack.herdr-signer`).
 
@@ -53,26 +55,25 @@ On the signing Mac:
 
 4. Delete the `.p12` copy.
 
-A rerun keeps the keychain and the runner registration, and rewrites the hook
-and the launchd job.
+A rerun keeps the runner registration and rewrites the hook and the launchd job;
+with `--p12` it also replaces the signing certificate. It deletes the signing
+keychain an older install made.
 
 ## Check it
 
 ```bash
 gh api repos/m4ttstack/herdr/actions/runners --jq '.runners[]|.name+" "+.status'
-sudo -u herdr-signer -H security find-identity -v -p codesigning \
-  /Users/herdr-signer/Library/Keychains/herdr-signing.keychain-db
+sudo ls -l /Users/herdr-signer/.herdr-signing
 ```
 
-The first lists `herdr-signer-<host> online`. The second lists one valid
-"Developer ID Application" identity.
+The first lists `herdr-signer-<host> online`. The second lists
+`developer-id.p12` and `p12-password`, each `-rw-------` and owned by
+`herdr-signer`.
 
-codesign builds the certificate chain from keychains only, never online, so
-the keychain also holds Apple's Developer ID intermediates
-(`ms/runner/apple/`, Apple's files from
-https://www.apple.com/certificateauthority/). The installer imports them, and
-every release job imports them again, so a runner set up before they existed
-needs no rerun.
+rcodesign reads only the legacy `.p12` format. If a release fails to sign with
+"incorrect password given when decrypting PFX data", convert the export and
+install again with the converted file:
+`openssl pkcs12 -in developer-id.p12 -nodes | openssl pkcs12 -export -legacy -out developer-id-legacy.p12`.
 
 ## Publish
 

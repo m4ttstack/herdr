@@ -78,32 +78,18 @@ jobs:
       - name: Sign
         run: |
           set -euo pipefail
-          : "${HERDR_SIGNING_KEYCHAIN:?the runner has no signing keychain; see ms/runner/README.md}"
-          security unlock-keychain -p "$(cat "$HERDR_SIGNING_KEYCHAIN_PASSWORD_FILE")" "$HERDR_SIGNING_KEYCHAIN"
-          # A launchd runner's user starts with an empty search list, and codesign
-          # finds the identity's private key only through that list.
-          security list-keychains -d user -s "$HERDR_SIGNING_KEYCHAIN"
-          security default-keychain -d user -s "$HERDR_SIGNING_KEYCHAIN"
-          # codesign builds the chain from keychains only, never online.
-          for cer in ms/runner/apple/*.cer; do
-            out="$(security import "$cer" -k "$HERDR_SIGNING_KEYCHAIN" 2>&1)" || case "$out" in
-              *"already exists"*) ;;
-              *) echo "::error::importing $cer: $out"; exit 1 ;;
-            esac
-          done
-          identity="$(security find-identity -v -p codesigning "$HERDR_SIGNING_KEYCHAIN" \
-            | awk '/"Developer ID Application:/ { print $2; exit }')"
-          [ -n "$identity" ] || { echo "::error::no Developer ID Application identity in the signing keychain"; exit 1; }
+          : "${HERDR_SIGNING_P12:?the runner has no signing certificate; see ms/runner/README.md}"
+          # The runner is a launchd daemon, outside any user session, where macOS
+          # refuses keychain signing; rcodesign signs from the .p12 file instead.
+          tarball="$RUNNER_TEMP/apple-codesign-0.29.0-macos-universal.tar.gz"
+          curl -fsSL -o "$tarball" \
+            https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign/0.29.0/apple-codesign-0.29.0-macos-universal.tar.gz
+          echo "d98372d5524226ccf9dc0eda03d4e4f5826182dabb2fc3f2bd303ed9113a748d  $tarball" | shasum -a 256 -c -
+          tar -xzf "$tarball" -C "$RUNNER_TEMP"
+          rcodesign="$RUNNER_TEMP/apple-codesign-0.29.0-macos-universal/rcodesign"
           for asset in herdr-macos-aarch64 herdr-macos-x86_64; do
-            codesign --force --sign "$identity" --keychain "$HERDR_SIGNING_KEYCHAIN" \
-              --options runtime --timestamp "dist/$asset" || {
-              echo "::group::signing keychain"
-              security find-identity -p codesigning "$HERDR_SIGNING_KEYCHAIN"
-              security find-certificate -a "$HERDR_SIGNING_KEYCHAIN" | grep '"labl"'
-              security list-keychains -d user
-              echo "::endgroup::"
-              exit 1
-            }
+            "$rcodesign" sign --p12-file "$HERDR_SIGNING_P12" --p12-password-file "$HERDR_SIGNING_P12_PASSWORD_FILE" \
+              --code-signature-flags runtime "dist/$asset"
           done
 
       - name: Verify signatures, architectures and version
@@ -166,8 +152,3 @@ jobs:
           if [ "$newest" = "$base" ] && [ "$current" != "$BRANCH" ]; then
             echo "::warning::$BRANCH is now the newest base. Make it the default branch (the job's token cannot): gh repo edit $REPO --default-branch $BRANCH"
           fi
-
-      - name: Lock the signing keychain
-        if: always()
-        run: |
-          [ -z "${HERDR_SIGNING_KEYCHAIN:-}" ] || security lock-keychain "$HERDR_SIGNING_KEYCHAIN"

@@ -35,12 +35,15 @@ esac
 REPO=m4ttstack/herdr
 ZIG_VERSION=0.16.0
 # Its own user, not the mattstack CI user: every job a runner takes can read
-# that user's keychains, and mattstack's runners take pull request jobs.
+# that user's files, the signing .p12 among them, and mattstack's runners take
+# pull request jobs.
 CI_USER=herdr-signer
 CI_HOME=/Users/$CI_USER
 HOOK_DIR=/usr/local/herdr-signer
-KEYCHAIN=$CI_HOME/Library/Keychains/herdr-signing.keychain-db
-KEYCHAIN_PASSWORD_FILE=$CI_HOME/.herdr-signing/keychain-password
+SIGNING_DIR=$CI_HOME/.herdr-signing
+SIGNING_P12=$SIGNING_DIR/developer-id.p12
+SIGNING_P12_PASSWORD_FILE=$SIGNING_DIR/p12-password
+OLD_KEYCHAIN=$CI_HOME/Library/Keychains/herdr-signing.keychain-db
 HOST=$(scutil --get LocalHostName | tr '[:upper:]' '[:lower:]')
 NAME=herdr-signer-$HOST
 DIR=$CI_HOME/runner
@@ -94,49 +97,22 @@ sudo -u "$CI_USER" -H bash -c '
   rustup target add aarch64-apple-darwin x86_64-apple-darwin
 '
 
-has_identity() {
-  sudo -u "$CI_USER" -H security find-identity -v -p codesigning "$KEYCHAIN" 2>/dev/null | grep -q '"Developer ID Application:'
-}
-if ! has_identity; then
-  [ -n "$P12" ] || { echo "The signing keychain has no Developer ID Application identity yet: pass --p12." >&2; exit 1; }
+# Release jobs sign with rcodesign from this file: a launchd daemon runs outside
+# any user session, where macOS refuses keychain signing.
+if [ -n "$P12" ]; then
   read -r -s -p "Password of $P12: " P12_PASSWORD
   echo
-  sudo -u "$CI_USER" -H mkdir -p "$(dirname "$KEYCHAIN_PASSWORD_FILE")" "$(dirname "$KEYCHAIN")"
-  sudo -u "$CI_USER" -H chmod 700 "$(dirname "$KEYCHAIN_PASSWORD_FILE")"
-  if ! sudo test -f "$KEYCHAIN"; then
-    KEYCHAIN_PASSWORD=$(openssl rand -base64 24)
-    printf '%s' "$KEYCHAIN_PASSWORD" | sudo -u "$CI_USER" -H tee "$KEYCHAIN_PASSWORD_FILE" >/dev/null
-    sudo -u "$CI_USER" -H chmod 600 "$KEYCHAIN_PASSWORD_FILE"
-    sudo -u "$CI_USER" -H security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
-    # No auto-lock: a release job unlocks it with the password file.
-    sudo -u "$CI_USER" -H security set-keychain-settings "$KEYCHAIN"
-  else
-    KEYCHAIN_PASSWORD=$(sudo -u "$CI_USER" -H cat "$KEYCHAIN_PASSWORD_FILE")
-  fi
-  # Not $TMPDIR: the runner user cannot read yours.
-  P12_COPY=$(mktemp /tmp/herdr-signing.XXXXXX)
-  trap 'sudo rm -f "$P12_COPY"' EXIT
-  cp "$P12" "$P12_COPY"
-  sudo chown "$CI_USER" "$P12_COPY"
-  sudo chmod 600 "$P12_COPY"
-  sudo -u "$CI_USER" -H security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
-  # -f: the copy has no .p12 extension to infer the format from.
-  # -x: the private key can never be exported from this keychain, even by a
-  # job that knows the keychain password.
-  sudo -u "$CI_USER" -H security import "$P12_COPY" -k "$KEYCHAIN" -f pkcs12 -P "$P12_PASSWORD" -x -T /usr/bin/codesign
-  # Lets codesign use the key without a GUI prompt, which a launchd job cannot answer.
-  sudo -u "$CI_USER" -H security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
-  # codesign builds the chain from keychains only; ms-release.yml re-imports these too.
-  for cer in "$(dirname "$0")"/apple/*.cer; do
-    CER_COPY=$(mktemp /tmp/herdr-signing-ca.XXXXXX)
-    cp "$cer" "$CER_COPY"
-    sudo chown "$CI_USER" "$CER_COPY"
-    sudo -u "$CI_USER" -H security import "$CER_COPY" -k "$KEYCHAIN" >/dev/null 2>&1 || true
-    sudo rm -f "$CER_COPY"
-  done
+  sudo -u "$CI_USER" -H mkdir -p "$SIGNING_DIR"
+  sudo chmod 700 "$SIGNING_DIR"
+  sudo install -o "$CI_USER" -m 600 "$P12" "$SIGNING_P12"
+  printf '%s' "$P12_PASSWORD" | sudo -u "$CI_USER" -H tee "$SIGNING_P12_PASSWORD_FILE" >/dev/null
+  sudo chmod 600 "$SIGNING_P12_PASSWORD_FILE"
 fi
-has_identity || {
-  echo "The signing keychain holds no valid Developer ID Application identity. See ms/runner/README.md." >&2; exit 1; }
+sudo test -f "$SIGNING_P12" || { echo "The runner has no signing certificate yet: pass --p12." >&2; exit 1; }
+if sudo test -f "$OLD_KEYCHAIN"; then
+  sudo -u "$CI_USER" -H security delete-keychain "$OLD_KEYCHAIN"
+  sudo rm -f "$SIGNING_DIR/keychain-password"
+fi
 
 if ! sudo test -f "$DIR/.runner"; then
   TARBALL=$(mktemp /tmp/actions-runner.XXXXXX)
@@ -168,8 +144,8 @@ sudo tee "$PLIST" >/dev/null <<PLIST
     <key>HOME</key><string>$CI_HOME</string>
     <key>PATH</key><string>$TOOL_PATH</string>
     <key>ACTIONS_RUNNER_HOOK_JOB_STARTED</key><string>$HOOK_DIR/job-started.sh</string>
-    <key>HERDR_SIGNING_KEYCHAIN</key><string>$KEYCHAIN</string>
-    <key>HERDR_SIGNING_KEYCHAIN_PASSWORD_FILE</key><string>$KEYCHAIN_PASSWORD_FILE</string>
+    <key>HERDR_SIGNING_P12</key><string>$SIGNING_P12</string>
+    <key>HERDR_SIGNING_P12_PASSWORD_FILE</key><string>$SIGNING_P12_PASSWORD_FILE</string>
   </dict>
 </dict>
 </plist>
