@@ -153,8 +153,13 @@ if [ -n "$P12" ]; then
   sudo install -o root -g wheel -m 600 "$P12" "$KEY_DIR/developer-id.p12"
   printf '%s' "$P12_PASSWORD" | sudo sh -c 'umask 077; cat > "$1"' _ "$KEY_DIR/p12-password"
 elif sudo test -f "$OLD_SIGNING_DIR/developer-id.p12" && ! sudo test -f "$KEY_DIR/developer-id.p12"; then
-  # An older install kept the key in the runner user's home.
-  sudo mv "$OLD_SIGNING_DIR/developer-id.p12" "$OLD_SIGNING_DIR/p12-password" "$KEY_DIR/"
+  # An older install kept the key in the runner user's home, where build code
+  # could swap a file for a link: read as that user, never move as root.
+  for file in developer-id.p12 p12-password; do
+    sudo -u "$CI_USER" cat "$OLD_SIGNING_DIR/$file" | sudo sh -c 'umask 077; cat > "$1"' _ "$KEY_DIR/$file.new"
+  done
+  # The .p12 goes last: its presence is what marks the migration done.
+  for file in p12-password developer-id.p12; do sudo mv "$KEY_DIR/$file.new" "$KEY_DIR/$file"; done
 fi
 sudo rm -rf "$OLD_SIGNING_DIR"
 if [ -n "$NOTARY_KEY" ]; then
