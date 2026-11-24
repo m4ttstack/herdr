@@ -26,7 +26,16 @@ fi
 START="$(git symbolic-ref --quiet --short HEAD || git rev-parse HEAD)"
 
 LOG="$(mktemp)"
-trap 'rm -f "$LOG"' EXIT
+DONE=""
+on_exit() {
+  local code=$?
+  set +e
+  rm -f "$LOG"
+  [ -z "$DONE" ] || exit "$code"
+  clean_up
+  case "$code" in 3|4) exit "$code" ;; *) exit 4 ;; esac
+}
+trap on_exit EXIT
 
 in_rebase() {
   [ -d "$(git rev-parse --git-path rebase-merge)" ] || [ -d "$(git rev-parse --git-path rebase-apply)" ]
@@ -39,18 +48,16 @@ clean_up() {
       || rm -rf "$(git rev-parse --git-path rebase-merge)" "$(git rev-parse --git-path rebase-apply)"
   fi
   git reset -q --hard
-  git switch -q -f "$START"
+  git checkout -q -f "$START" --
   git branch -q -D "$NEW_BRANCH" 2>/dev/null || true
 }
 
 conflict() { # conflict <subject>
-  clean_up
   echo "ms/rebase-onto.sh: fork commit \"$1\" conflicts with $TAG" >&2
   exit 3
 }
 
 failed() { # failed <detail>
-  clean_up
   echo "ms/rebase-onto.sh: rebase failed onto $TAG: $1" >&2
   exit 4
 }
@@ -106,4 +113,5 @@ if [ -n "$README_COMMIT" ] && grep -qF "$OLD_VERSION" README.md; then
 fi
 
 echo "ms/rebase-onto.sh: $NEW_BRANCH = $TAG + $(git rev-list --count "$TAG..$NEW_BRANCH") fork commits"
+DONE=yes
 exit 0

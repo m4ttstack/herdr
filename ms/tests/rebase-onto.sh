@@ -89,6 +89,7 @@ cat > "$STUBS/git" <<STUB
 #!/bin/bash
 if [ "\$1 \$2 \$3" = "rebase -q --onto" ] && [ -n "\${STUB_STOP:-}" ]; then shift 2; exec "$REAL_GIT" rebase -q --exec false "\$@"; fi
 if [ "\$1 \$2" = "rebase --abort" ] && [ -n "\${STUB_FAIL_ABORT:-}" ]; then echo "stub: abort failed" >&2; exit 1; fi
+case "\$*" in "commit -q --fixup="*) [ -z "\${STUB_FAIL_FIXUP:-}" ] || { echo "stub: commit failed" >&2; exit 1; } ;; esac
 exec "$REAL_GIT" "\$@"
 STUB
 chmod +x "$STUBS/git"
@@ -102,6 +103,19 @@ g switch -q mattstack/1.0.0
 ERR="$(cd "$REPO" && STUB_FAIL_ABORT=1 PATH="$STUBS:$PATH" "$SCRIPT" v1.0.2 2>&1 >/dev/null)"; CODE=$?
 if [ "$CODE" -eq 3 ]; then ok "a conflict whose --abort fails still exits 3"; else bad "a conflict whose --abort fails still exits 3 (got $CODE: $ERR)"; fi
 clean_on "a failed --abort" mattstack/1.0.2 mattstack/1.0.0
+
+# From a detached HEAD, a conflict still exits 3 and returns to that commit.
+g switch -q --detach mattstack/1.0.0
+ERR="$(cd "$REPO" && "$SCRIPT" v1.0.2 2>&1 >/dev/null)"; CODE=$?
+if [ "$CODE" -eq 3 ]; then ok "a conflict from a detached HEAD exits 3"; else bad "a conflict from a detached HEAD exits 3 (got $CODE: $ERR)"; fi
+clean_on "a detached start" mattstack/1.0.2 ""
+if [ "$(g rev-parse HEAD)" = "$(g rev-parse mattstack/1.0.0)" ]; then ok "a detached start: back on the same commit"; else bad "a detached start: back on the same commit"; fi
+
+# A failure after the rebase (here, the README commit) cleans up too.
+g switch -q -f mattstack/1.0.0; g branch -q -D mattstack/1.0.3
+ERR="$(cd "$REPO" && STUB_FAIL_FIXUP=1 PATH="$STUBS:$PATH" "$SCRIPT" v1.0.3 2>&1 >/dev/null)"; CODE=$?
+if [ "$CODE" -eq 4 ]; then ok "a failed README commit exits 4"; else bad "a failed README commit exits 4 (got $CODE: $ERR)"; fi
+clean_on "a failed README commit" mattstack/1.0.3 mattstack/1.0.0
 
 [ "$FAILS" -eq 0 ] || { echo "rebase-onto.sh: $FAILS check(s) failed" >&2; exit 1; }
 echo "PASS: rebase-onto"
