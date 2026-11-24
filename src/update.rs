@@ -24,9 +24,10 @@ use serde::{Deserialize, Deserializer};
 
 const STABLE_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/latest.json";
 const PREVIEW_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/preview.json";
-const FORK_UPDATE_MANIFEST_URL: &str =
+pub(crate) const FORK_UPDATE_MANIFEST_URL: &str =
     "https://github.com/m4ttstack/herdr/releases/latest/download/latest.json";
 const FORK_PREVIEW_REFUSAL: &str = "This herdr is the mattstack fork. It updates only from m4ttstack/herdr, which has no preview channel.";
+pub(crate) const UNRELEASED_FORK_REFUSAL: &str = "This herdr was built from the mattstack fork's source without ms/build.sh, so no release matches it and it does not update itself. Install a release from https://github.com/m4ttstack/herdr/releases instead.";
 const HOMEBREW_FORMULA_API_URL: &str = "https://formulae.brew.sh/api/formula/herdr.json";
 const HERDR_UPDATE_COMMAND: &str = "herdr update";
 const HOMEBREW_UPDATE_COMMAND: &str = "brew update && brew upgrade herdr";
@@ -331,15 +332,42 @@ impl ReleaseInfo {
     }
 }
 
-fn fetch_update_manifest() -> Result<UpdateManifest, String> {
-    fetch_json_manifest(update_manifest_url(crate::build_info::is_fork()))
+/// The manifest an update check reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManifestSource {
+    Stable,
+    Preview,
+    Fork,
 }
 
-fn update_manifest_url(is_fork: bool) -> &'static str {
-    if is_fork {
-        FORK_UPDATE_MANIFEST_URL
-    } else {
-        STABLE_UPDATE_MANIFEST_URL
+/// A fork release reads only the fork's manifest, whatever channel the config
+/// names; a fork build that is no release reads none.
+fn manifest_source_for(
+    fork: crate::build_info::Fork,
+    channel: UpdateChannel,
+) -> Result<ManifestSource, String> {
+    use crate::build_info::Fork;
+    match (fork, channel) {
+        (Fork::Release, _) => Ok(ManifestSource::Fork),
+        (Fork::Unreleased, _) => Err(UNRELEASED_FORK_REFUSAL.to_string()),
+        (Fork::None, UpdateChannel::Preview) => Ok(ManifestSource::Preview),
+        (Fork::None, UpdateChannel::Stable) => Ok(ManifestSource::Stable),
+    }
+}
+
+fn manifest_url(source: ManifestSource) -> &'static str {
+    match source {
+        ManifestSource::Stable => STABLE_UPDATE_MANIFEST_URL,
+        ManifestSource::Preview => PREVIEW_UPDATE_MANIFEST_URL,
+        ManifestSource::Fork => FORK_UPDATE_MANIFEST_URL,
+    }
+}
+
+fn update_check_message(source: ManifestSource) -> String {
+    match source {
+        ManifestSource::Fork => "checking m4ttstack/herdr for updates...".to_string(),
+        ManifestSource::Stable => "checking stable channel for updates...".to_string(),
+        ManifestSource::Preview => "checking preview channel for updates...".to_string(),
     }
 }
 
@@ -424,12 +452,14 @@ fn release_info_from_manifest_for(
         .ok_or_else(|| format!("invalid version in update manifest: {}", manifest.version))?;
 
     let should_install = match installed_fork_revision {
-        Some(current_revision) => fork_should_install(
-            &latest,
-            manifest.fork_revision.unwrap_or(0),
-            current,
-            current_revision,
-        ),
+        Some(current_revision) => {
+            let latest_revision = manifest.fork_revision.ok_or_else(|| {
+                format!(
+                    "update manifest for herdr {latest} has no fork_revision, so it is not a mattstack fork release"
+                )
+            })?;
+            fork_should_install(&latest, latest_revision, current, current_revision)
+        }
         None => stable_channel_should_install(&latest, current, installed_is_preview),
     };
     if !should_install {
@@ -591,12 +621,12 @@ fn first_windows_stable_is_pending(
 }
 
 fn check_latest() -> Result<Option<ReleaseInfo>, String> {
-    let channel = UpdateChannel::configured();
-    if channel == UpdateChannel::Preview && !crate::build_info::is_fork() {
+    let source = manifest_source_for(crate::build_info::fork(), UpdateChannel::configured())?;
+    if source == ManifestSource::Preview {
         return release_info_from_preview_manifest(&fetch_preview_manifest()?);
     }
 
-    let manifest = fetch_update_manifest()?;
+    let manifest: UpdateManifest = fetch_json_manifest(manifest_url(source))?;
     if first_windows_stable_is_pending(&manifest, cfg!(windows), crate::build_info::is_preview()) {
         tracing::info!("waiting for the first stable Windows release");
         return Ok(None);
@@ -2179,48 +2209,74 @@ fn homebrew_cellar_keg_root(path: &Path) -> Option<PathBuf> {
 // ---------------------------------------------------------------------------
 
 /// Manual self-update command (`herdr update`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PackageManager {
+    Homebrew,
+    Mise,
+    Nix,
+}
+
+fn detect_package_manager() -> Option<PackageManager> {
+    if is_homebrew_managed_install() {
+        Some(PackageManager::Homebrew)
+    } else if is_mise_managed_install() {
+        Some(PackageManager::Mise)
+    } else if is_nix_managed_install() {
+        Some(PackageManager::Nix)
+    } else {
+        None
+    }
+}
+
+/// Why `herdr update` must not replace this binary. A fork release updates
+/// itself however it was installed: no package manager carries it.
+fn self_update_refusal(
+    fork: crate::build_info::Fork,
+    channel: UpdateChannel,
+    manager: Option<PackageManager>,
+) -> Option<String> {
+    use crate::build_info::Fork;
+    let preview = channel == UpdateChannel::Preview;
+    match (fork, manager) {
+        (Fork::Unreleased, _) => Some(UNRELEASED_FORK_REFUSAL.to_string()),
+        (Fork::Release, _) | (Fork::None, None) => None,
+        (Fork::None, Some(PackageManager::Homebrew)) if preview => Some(
+            "self-update is disabled for Homebrew installs; preview is only available for direct Herdr installs".into(),
+        ),
+        (Fork::None, Some(PackageManager::Homebrew)) => Some(format!(
+            "self-update is disabled for Homebrew installs; run `{HOMEBREW_UPDATE_COMMAND}`"
+        )),
+        (Fork::None, Some(PackageManager::Mise)) if preview => Some(
+            "self-update is disabled for mise installs; preview is only available for direct Herdr installs".into(),
+        ),
+        (Fork::None, Some(PackageManager::Mise)) => Some(format!(
+            "self-update is disabled for mise installs; run `{MISE_UPDATE_COMMAND}`"
+        )),
+        (Fork::None, Some(PackageManager::Nix)) if preview => Some(
+            "self-update is disabled for Nix installs; preview is only available for direct Herdr installs".into(),
+        ),
+        (Fork::None, Some(PackageManager::Nix)) => Some(
+            "self-update is disabled for Nix installs; update with `nix profile upgrade` or update the flake input that provides Herdr".into(),
+        ),
+    }
+}
+
 pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
     let channel = UpdateChannel::configured();
-    let is_fork = crate::build_info::is_fork();
+    let fork = crate::build_info::fork();
 
-    if !is_fork && is_homebrew_managed_install() {
-        if channel == UpdateChannel::Preview {
-            return Err(
-                "self-update is disabled for Homebrew installs; preview is only available for direct Herdr installs".into(),
-            );
-        }
-        return Err(format!(
-            "self-update is disabled for Homebrew installs; run `{HOMEBREW_UPDATE_COMMAND}`"
-        ));
-    }
-
-    if !is_fork && is_mise_managed_install() {
-        if channel == UpdateChannel::Preview {
-            return Err(
-                "self-update is disabled for mise installs; preview is only available for direct Herdr installs".into(),
-            );
-        }
-        return Err(format!(
-            "self-update is disabled for mise installs; run `{MISE_UPDATE_COMMAND}`"
-        ));
-    }
-
-    if !is_fork && is_nix_managed_install() {
-        if channel == UpdateChannel::Preview {
-            return Err(
-                "self-update is disabled for Nix installs; preview is only available for direct Herdr installs".into(),
-            );
-        }
-        return Err(
-            "self-update is disabled for Nix installs; update with `nix profile upgrade` or update the flake input that provides Herdr".into(),
-        );
+    if let Some(reason) = self_update_refusal(fork, channel, detect_package_manager()) {
+        return Err(reason);
     }
 
     if running_inside_herdr() {
         return Err("run `herdr update` outside herdr after detaching from the session".into());
     }
 
-    eprintln!("checking {} channel for updates...", channel.as_str());
+    eprintln!(
+        "{}",
+        update_check_message(manifest_source_for(fork, channel)?)
+    );
 
     let current = Version::current();
 
@@ -2442,28 +2498,20 @@ pub fn auto_update(events: tokio::sync::mpsc::Sender<crate::events::AppEvent>) {
         return;
     }
 
-    let configured_channel = UpdateChannel::configured();
-    let is_fork = crate::build_info::is_fork();
-    if !is_fork && is_homebrew_managed_install() {
-        if configured_channel == UpdateChannel::Preview {
-            crate::logging::update_check_failed(
-                "preview channel is not available for Homebrew installs",
-            );
+    match auto_update_plan(
+        crate::build_info::fork(),
+        UpdateChannel::configured(),
+        detect_package_manager(),
+    ) {
+        AutoUpdatePlan::Skip(reason) => {
+            crate::logging::update_check_failed(reason);
             return;
         }
-        auto_update_homebrew(events);
-        return;
-    }
-
-    if !is_fork && is_mise_managed_install() && configured_channel == UpdateChannel::Preview {
-        crate::logging::update_check_failed("preview channel is not available for mise installs");
-        return;
-    }
-
-    let nix_managed_install = !is_fork && is_nix_managed_install();
-    if nix_managed_install && configured_channel == UpdateChannel::Preview {
-        crate::logging::update_check_failed("preview channel is not available for Nix installs");
-        return;
+        AutoUpdatePlan::Homebrew => {
+            auto_update_homebrew(events);
+            return;
+        }
+        AutoUpdatePlan::Check => {}
     }
 
     let release = match check_latest() {
@@ -2498,6 +2546,40 @@ pub fn auto_update(events: tokio::sync::mpsc::Sender<crate::events::AppEvent>) {
     });
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoUpdatePlan {
+    /// Check the manifest and announce a newer build.
+    Check,
+    /// Ask Homebrew for a newer formula.
+    Homebrew,
+    /// Check nothing, logging why.
+    Skip(&'static str),
+}
+
+fn auto_update_plan(
+    fork: crate::build_info::Fork,
+    channel: UpdateChannel,
+    manager: Option<PackageManager>,
+) -> AutoUpdatePlan {
+    use crate::build_info::Fork;
+    let preview = channel == UpdateChannel::Preview;
+    match (fork, manager) {
+        (Fork::Unreleased, _) => AutoUpdatePlan::Skip(UNRELEASED_FORK_REFUSAL),
+        (Fork::Release, _) => AutoUpdatePlan::Check,
+        (Fork::None, Some(PackageManager::Homebrew)) if preview => {
+            AutoUpdatePlan::Skip("preview channel is not available for Homebrew installs")
+        }
+        (Fork::None, Some(PackageManager::Homebrew)) => AutoUpdatePlan::Homebrew,
+        (Fork::None, Some(PackageManager::Mise)) if preview => {
+            AutoUpdatePlan::Skip("preview channel is not available for mise installs")
+        }
+        (Fork::None, Some(PackageManager::Nix)) if preview => {
+            AutoUpdatePlan::Skip("preview channel is not available for Nix installs")
+        }
+        (Fork::None, _) => AutoUpdatePlan::Check,
+    }
+}
+
 fn auto_update_homebrew(events: tokio::sync::mpsc::Sender<crate::events::AppEvent>) {
     let version = match check_homebrew_latest() {
         Ok(Some(version)) => version,
@@ -2526,7 +2608,8 @@ fn auto_update_homebrew(events: tokio::sync::mpsc::Sender<crate::events::AppEven
 }
 
 fn homebrew_release_notes_body(version: &Version) -> String {
-    let manifest = fetch_update_manifest().ok();
+    // Only stock herdr updates through Homebrew; a fork build never gets here.
+    let manifest = fetch_json_manifest::<UpdateManifest>(STABLE_UPDATE_MANIFEST_URL).ok();
     homebrew_release_notes_body_from_manifest(version, manifest.as_ref())
 }
 
@@ -4114,9 +4197,12 @@ mod tests {
 
     #[test]
     fn fork_build_fetches_only_the_fork_manifest() {
-        assert_eq!(update_manifest_url(true), FORK_UPDATE_MANIFEST_URL);
-        assert!(!update_manifest_url(true).contains("herdr.dev"));
-        assert_eq!(update_manifest_url(false), STABLE_UPDATE_MANIFEST_URL);
+        assert_eq!(manifest_url(ManifestSource::Fork), FORK_UPDATE_MANIFEST_URL);
+        assert!(!manifest_url(ManifestSource::Fork).contains("herdr.dev"));
+        assert_eq!(
+            manifest_url(ManifestSource::Stable),
+            STABLE_UPDATE_MANIFEST_URL
+        );
     }
 
     #[test]
@@ -4186,5 +4272,178 @@ mod tests {
             install_command_for(false, false, true, false),
             MISE_UPDATE_COMMAND
         );
+    }
+
+    use crate::build_info::Fork;
+
+    #[test]
+    fn a_fork_release_reads_the_fork_manifest_on_either_channel() {
+        for channel in [UpdateChannel::Stable, UpdateChannel::Preview] {
+            assert_eq!(
+                manifest_source_for(Fork::Release, channel),
+                Ok(ManifestSource::Fork)
+            );
+        }
+    }
+
+    #[test]
+    fn stock_herdr_reads_the_channel_it_is_set_to() {
+        assert_eq!(
+            manifest_source_for(Fork::None, UpdateChannel::Stable),
+            Ok(ManifestSource::Stable)
+        );
+        assert_eq!(
+            manifest_source_for(Fork::None, UpdateChannel::Preview),
+            Ok(ManifestSource::Preview)
+        );
+    }
+
+    #[test]
+    fn an_unreleased_fork_build_reads_no_manifest() {
+        for channel in [UpdateChannel::Stable, UpdateChannel::Preview] {
+            assert_eq!(
+                manifest_source_for(Fork::Unreleased, channel),
+                Err(UNRELEASED_FORK_REFUSAL.to_string())
+            );
+        }
+        assert!(UNRELEASED_FORK_REFUSAL.contains("ms/build.sh"));
+        assert!(UNRELEASED_FORK_REFUSAL.contains("https://github.com/m4ttstack/herdr/releases"));
+    }
+
+    #[test]
+    fn a_fork_build_says_it_checks_the_fork_not_a_channel() {
+        assert_eq!(
+            update_check_message(ManifestSource::Fork),
+            "checking m4ttstack/herdr for updates..."
+        );
+        assert_eq!(
+            update_check_message(ManifestSource::Preview),
+            "checking preview channel for updates..."
+        );
+        assert_eq!(
+            update_check_message(ManifestSource::Stable),
+            "checking stable channel for updates..."
+        );
+    }
+
+    const MANAGERS: [Option<PackageManager>; 4] = [
+        None,
+        Some(PackageManager::Homebrew),
+        Some(PackageManager::Mise),
+        Some(PackageManager::Nix),
+    ];
+
+    #[test]
+    fn self_update_on_a_fork_release_ignores_package_managers() {
+        for manager in MANAGERS {
+            for channel in [UpdateChannel::Stable, UpdateChannel::Preview] {
+                assert_eq!(self_update_refusal(Fork::Release, channel, manager), None);
+            }
+        }
+    }
+
+    #[test]
+    fn self_update_of_stock_herdr_defers_to_package_managers() {
+        assert_eq!(
+            self_update_refusal(
+                Fork::None,
+                UpdateChannel::Stable,
+                Some(PackageManager::Homebrew)
+            ),
+            Some(format!(
+                "self-update is disabled for Homebrew installs; run `{HOMEBREW_UPDATE_COMMAND}`"
+            ))
+        );
+        assert_eq!(
+            self_update_refusal(Fork::None, UpdateChannel::Preview, Some(PackageManager::Mise)),
+            Some(
+                "self-update is disabled for mise installs; preview is only available for direct Herdr installs"
+                    .to_string()
+            )
+        );
+        assert!(
+            self_update_refusal(Fork::None, UpdateChannel::Stable, Some(PackageManager::Nix))
+                .is_some_and(
+                    |reason| reason.starts_with("self-update is disabled for Nix installs")
+                )
+        );
+        assert_eq!(
+            self_update_refusal(Fork::None, UpdateChannel::Stable, None),
+            None
+        );
+    }
+
+    #[test]
+    fn self_update_refuses_an_unreleased_fork_build() {
+        for manager in MANAGERS {
+            assert_eq!(
+                self_update_refusal(Fork::Unreleased, UpdateChannel::Stable, manager),
+                Some(UNRELEASED_FORK_REFUSAL.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn auto_update_on_a_fork_release_checks_the_fork_whatever_installed_it() {
+        for manager in MANAGERS {
+            for channel in [UpdateChannel::Stable, UpdateChannel::Preview] {
+                assert_eq!(
+                    auto_update_plan(Fork::Release, channel, manager),
+                    AutoUpdatePlan::Check
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn auto_update_of_stock_herdr_defers_to_package_managers() {
+        use PackageManager::*;
+        let cases = [
+            (
+                UpdateChannel::Stable,
+                Some(Homebrew),
+                AutoUpdatePlan::Homebrew,
+            ),
+            (
+                UpdateChannel::Preview,
+                Some(Homebrew),
+                AutoUpdatePlan::Skip("preview channel is not available for Homebrew installs"),
+            ),
+            (UpdateChannel::Stable, Some(Mise), AutoUpdatePlan::Check),
+            (
+                UpdateChannel::Preview,
+                Some(Mise),
+                AutoUpdatePlan::Skip("preview channel is not available for mise installs"),
+            ),
+            (UpdateChannel::Stable, Some(Nix), AutoUpdatePlan::Check),
+            (
+                UpdateChannel::Preview,
+                Some(Nix),
+                AutoUpdatePlan::Skip("preview channel is not available for Nix installs"),
+            ),
+            (UpdateChannel::Stable, None, AutoUpdatePlan::Check),
+        ];
+        for (channel, manager, plan) in cases {
+            assert_eq!(auto_update_plan(Fork::None, channel, manager), plan);
+        }
+    }
+
+    #[test]
+    fn auto_update_refuses_an_unreleased_fork_build() {
+        for manager in MANAGERS {
+            assert_eq!(
+                auto_update_plan(Fork::Unreleased, UpdateChannel::Stable, manager),
+                AutoUpdatePlan::Skip(UNRELEASED_FORK_REFUSAL)
+            );
+        }
+    }
+
+    #[test]
+    fn a_fork_build_refuses_a_fork_manifest_without_fork_revision() {
+        let mut manifest = fork_manifest(3);
+        manifest.fork_revision = None;
+        let current = Version::parse("0.9.5").unwrap();
+        let err = release_info_from_manifest_for(&manifest, &current, false, Some(1)).unwrap_err();
+        assert!(err.contains("fork_revision"), "{err}");
     }
 }

@@ -141,7 +141,10 @@ fn run_channel_command(args: &[String]) -> std::io::Result<i32> {
         Some("set") => channel_set(&args[1..]),
         Some("show") if args.len() == 1 => {
             let config = crate::config::Config::load().config;
-            println!("{}", config.update.channel.as_str());
+            println!(
+                "{}",
+                shown_channel(crate::build_info::is_fork(), config.update.channel.as_str())
+            );
             Ok(0)
         }
         Some("help" | "--help" | "-h") => {
@@ -161,11 +164,9 @@ fn channel_set(args: &[String]) -> std::io::Result<i32> {
         return Ok(2);
     };
 
-    if channel == "preview" {
-        if let Err(reason) = crate::update::preview_channel_allowed(crate::build_info::is_fork()) {
-            eprintln!("{reason}");
-            return Ok(1);
-        }
+    if let Some(reason) = fork_channel_set_rejection(channel, crate::build_info::is_fork()) {
+        eprintln!("{reason}");
+        return Ok(1);
     }
 
     if let Some(reason) = channel_set_rejection(
@@ -239,6 +240,22 @@ fn parse_channel_set_arg(args: &[String]) -> Option<&str> {
     } else {
         None
     }
+}
+
+/// The fork has one channel, its own releases, whatever the config file says.
+fn shown_channel(is_fork: bool, configured: &'static str) -> &'static str {
+    if is_fork {
+        "stable"
+    } else {
+        configured
+    }
+}
+
+fn fork_channel_set_rejection(channel: &str, is_fork: bool) -> Option<String> {
+    if channel != "preview" {
+        return None;
+    }
+    crate::update::preview_channel_allowed(is_fork).err()
 }
 
 fn channel_set_rejection(
@@ -1080,6 +1097,21 @@ mod tests {
             super::parse_channel_set_arg(&["preview".to_string(), "stable".to_string()]),
             None
         );
+    }
+
+    #[test]
+    fn channel_show_never_prints_preview_on_a_fork_build() {
+        assert_eq!(super::shown_channel(true, "preview"), "stable");
+        assert_eq!(super::shown_channel(true, "stable"), "stable");
+        assert_eq!(super::shown_channel(false, "preview"), "preview");
+    }
+
+    #[test]
+    fn channel_set_refuses_preview_on_a_fork_build() {
+        assert!(super::fork_channel_set_rejection("preview", true)
+            .is_some_and(|reason| reason.contains("m4ttstack/herdr")));
+        assert_eq!(super::fork_channel_set_rejection("stable", true), None);
+        assert_eq!(super::fork_channel_set_rejection("preview", false), None);
     }
 
     #[test]
