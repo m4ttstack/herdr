@@ -34,7 +34,8 @@ job hands it.
   `~herdr-signer/.herdr-signing` moves there and is deleted;
 - installs the sudoers drop-in `/etc/sudoers.d/herdr-signer`
   (`ms/runner/sudoers`, mode 440), checked with `visudo -c` first, which lets
-  `herdr-signer` run the helper as root without a password and nothing else;
+  `herdr-signer` run the helper as root without a password and nothing else,
+  and gives anything an admin runs as `herdr-signer` its own terminal (`use_pty`);
 - registers runner `herdr-signer-<LocalHostName>` with the single label
   `herdr-signer`, run by launchd (`dev.mattstack.herdr-signer`).
 
@@ -145,11 +146,13 @@ gh workflow run ms-release.yml -R m4ttstack/herdr -f branch=mattstack/<upstream 
 gh run watch -R m4ttstack/herdr
 ```
 
-The job builds both CPUs, signs and notarizes them through the helper, fails
-unless `ms/verify-release.sh` accepts each one, and publishes `v<base>-ms.<N>` as the latest release
-with `herdr-builds.json` and `latest.json`. When it publishes a newer base it
-prints the `gh repo edit --default-branch` command to run, since its token
-cannot change the default branch.
+A GitHub-hosted job picks the version. The job on this runner builds both CPUs,
+signs and notarizes them through the helper, fails unless `ms/verify-release.sh`
+accepts each one, and reports their hashes; build code runs there, so it gets no
+token that can write. A second GitHub-hosted job checks the hashes and publishes
+`v<base>-ms.<N>` as the latest release with `herdr-builds.json` and `latest.json`.
+When it publishes a newer base it prints the `gh repo edit --default-branch`
+command to run, since its token cannot change the default branch.
 
 ## The nightly upstream check
 
