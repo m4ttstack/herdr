@@ -93,10 +93,7 @@ fn print_full_status(json: bool) -> std::io::Result<i32> {
 
     println!("client:");
     println!("  version: {}", crate::build_info::version());
-    println!(
-        "  channel: {}",
-        crate::config::Config::load().config.update.channel.as_str()
-    );
+    println!("  channel: {}", super::current_channel());
     println!("  protocol: {}", crate::protocol::PROTOCOL_VERSION);
     println!(
         "  endpoint_protocol_generation: {}",
@@ -133,10 +130,7 @@ fn print_client_status(json: bool) -> std::io::Result<()> {
     }
 
     println!("version: {}", crate::build_info::version());
-    println!(
-        "channel: {}",
-        crate::config::Config::load().config.update.channel.as_str()
-    );
+    println!("channel: {}", super::current_channel());
     println!("protocol: {}", crate::protocol::PROTOCOL_VERSION);
     println!(
         "endpoint_protocol_generation: {}",
@@ -292,7 +286,7 @@ struct UpdateStatusJson {
 fn client_status_json() -> ClientStatusJson {
     ClientStatusJson {
         version: crate::build_info::version(),
-        channel: crate::config::Config::load().config.update.channel.as_str(),
+        channel: super::current_channel(),
         protocol: crate::protocol::PROTOCOL_VERSION,
         endpoint_protocol_generation: crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION,
         endpoint_capabilities: vec![
@@ -410,6 +404,23 @@ fn print_status_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_status_never_reports_the_preview_channel_on_a_fork_build() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let path =
+            std::env::temp_dir().join(format!("herdr-status-channel-{}.toml", std::process::id()));
+        std::fs::write(&path, "[update]\nchannel = \"preview\"\n").unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let configured = crate::config::Config::load().config.update.channel;
+        let reported = client_status_json().channel;
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(configured.as_str(), "preview");
+        assert_eq!(reported, "stable");
+    }
 
     fn running_server(
         version: Option<&str>,
