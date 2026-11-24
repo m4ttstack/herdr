@@ -72,3 +72,20 @@ ruby -ryaml -e '
     exit 1
   end
 ' "$ROOT/.github/workflows/ms-release.yml" "$ROOT/ms/runner/install.sh" || exit 1
+
+# codesign --verify --strict alone passes ad-hoc and non-runtime signatures, so
+# Verify runs ms/verify-release.sh on each asset.
+ruby -ryaml -e '
+  steps = YAML.load_file(ARGV[0]).dig("jobs", "release", "steps")
+  verify = (steps.find { |s| s["name"].to_s.start_with?("Verify") } || {})["run"].to_s
+  missing = %w[herdr-macos-aarch64:arm64 herdr-macos-x86_64:x86_64].reject do |pair|
+    asset, arch = pair.split(":")
+    verify.include?("ms/verify-release.sh \"dist/$asset\" \"$arch\"") && verify.include?(pair)
+  end
+  if missing.empty?
+    puts "PASS: Verify checks each asset for a notarized Developer ID signature"
+  else
+    warn "FAIL Verify does not run ms/verify-release.sh on #{missing.join(", ")}"
+    exit 1
+  end
+' "$ROOT/.github/workflows/ms-release.yml" || exit 1
