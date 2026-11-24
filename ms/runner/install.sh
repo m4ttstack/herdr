@@ -1,21 +1,37 @@
 #!/bin/bash
 # Installs the herdr-signer runner: the one self-hosted runner that builds and
 # signs m4ttstack/herdr releases. Run it on the signing Mac, from a real terminal
-# at the repo root, as yourself: it needs sudo's password prompt, your gh login
-# and the Developer ID Application certificate exported as a .p12.
-# Usage: ms/runner/install.sh --p12 PATH [--registration-token TOKEN]
-# --registration-token takes a runner registration token minted elsewhere
+# at the repo root, as yourself: it needs sudo's password prompt, your gh login,
+# the Developer ID Application certificate exported as a .p12 and an App Store
+# Connect API key for notarization.
+# Usage: ms/runner/install.sh [--p12 PATH] [--notary-key-id ID --notary-issuer UUID
+#   --notary-key AuthKey_ID.p8] [--registration-token TOKEN]
+# The first install needs --p12 and the three notary flags; a rerun keeps the
+# key material already installed. --registration-token takes a runner
+# registration token minted elsewhere
 # (gh api -X POST repos/m4ttstack/herdr/actions/runners/registration-token),
 # for a Mac whose gh is not signed in.
 set -euo pipefail
 
 P12=""
+NOTARY_KEY_ID=""
+NOTARY_ISSUER=""
+NOTARY_KEY=""
 REGISTRATION_TOKEN=""
-USAGE="usage: ms/runner/install.sh --p12 PATH [--registration-token TOKEN]"
+USAGE="usage: ms/runner/install.sh [--p12 PATH] [--notary-key-id ID --notary-issuer UUID --notary-key PATH] [--registration-token TOKEN]"
+value() { # value <flag> <next arg>: the flag's value, or a refusal naming the flag
+  case "${2:-}" in
+    ''|--*) echo "$1 needs a value. $USAGE" >&2; exit 2 ;;
+  esac
+  printf '%s' "$2"
+}
 while [ $# -gt 0 ]; do
   case "$1" in
-    --p12) P12="${2:-}"; shift 2 ;;
-    --registration-token) REGISTRATION_TOKEN="${2:-}"; shift 2 ;;
+    --p12) P12="$(value "$1" "${2:-}")"; shift 2 ;;
+    --notary-key-id) NOTARY_KEY_ID="$(value "$1" "${2:-}")"; shift 2 ;;
+    --notary-issuer) NOTARY_ISSUER="$(value "$1" "${2:-}")"; shift 2 ;;
+    --notary-key) NOTARY_KEY="$(value "$1" "${2:-}")"; shift 2 ;;
+    --registration-token) REGISTRATION_TOKEN="$(value "$1" "${2:-}")"; shift 2 ;;
     -h|--help) echo "$USAGE"; exit 0 ;;
     *) echo "Unknown option $1. $USAGE" >&2; exit 2 ;;
   esac
@@ -25,6 +41,15 @@ if [ -n "$P12" ] && [ ! -f "$P12" ]; then
   echo "No file $P12. Export the Developer ID Application certificate as a .p12 first (see ms/runner/README.md), on the signing Mac." >&2
   exit 1
 fi
+if [ -n "$NOTARY_KEY_ID$NOTARY_ISSUER$NOTARY_KEY" ]; then
+  for pair in "--notary-key-id:$NOTARY_KEY_ID" "--notary-issuer:$NOTARY_ISSUER" "--notary-key:$NOTARY_KEY"; do
+    [ -n "${pair#*:}" ] || { echo "Notarization needs all three of --notary-key-id, --notary-issuer and --notary-key; ${pair%%:*} is missing." >&2; exit 2; }
+  done
+  [ -f "$NOTARY_KEY" ] || { echo "No file $NOTARY_KEY. Copy the App Store Connect API key's .p8 to this Mac first (see ms/runner/README.md)." >&2; exit 1; }
+fi
+# The install changes directory before it reads these.
+[ -z "$P12" ] || P12="$(cd "$(dirname "$P12")" && pwd -P)/$(basename "$P12")"
+[ -z "$NOTARY_KEY" ] || NOTARY_KEY="$(cd "$(dirname "$NOTARY_KEY")" && pwd -P)/$(basename "$NOTARY_KEY")"
 
 VERSION=2.338.2
 case "$(uname -m)" in
@@ -40,9 +65,12 @@ ZIG_VERSION=0.16.0
 CI_USER=herdr-signer
 CI_HOME=/Users/$CI_USER
 HOOK_DIR=/usr/local/herdr-signer
-SIGNING_DIR=$CI_HOME/.herdr-signing
-SIGNING_P12=$SIGNING_DIR/developer-id.p12
-SIGNING_P12_PASSWORD_FILE=$SIGNING_DIR/p12-password
+# Root-only: build code in a release job runs as $CI_USER and must not read the
+# key. Jobs sign through $HOOK_DIR/sign.sh, which sudoers lets $CI_USER run.
+KEY_DIR=$HOOK_DIR/keys
+OLD_SIGNING_DIR=$CI_HOME/.herdr-signing
+RCODESIGN_VERSION=0.29.0
+RCODESIGN_SHA256=d98372d5524226ccf9dc0eda03d4e4f5826182dabb2fc3f2bd303ed9113a748d
 OLD_KEYCHAIN=$CI_HOME/Library/Keychains/herdr-signing.keychain-db
 HOST=$(scutil --get LocalHostName | tr '[:upper:]' '[:lower:]')
 NAME=herdr-signer-$HOST
@@ -82,9 +110,28 @@ if sudo -u "$CI_USER" test -x "$HOME"; then
   exit 1
 fi
 
-# Root owns the hook, so a job cannot rewrite the rule that admits it.
-sudo mkdir -p "$HOOK_DIR"
+# Root owns the hook and the signing helper, so a job can rewrite neither the
+# rule that admits it nor the checks that guard the key.
+sudo install -d -o root -g wheel -m 755 "$HOOK_DIR"
 sudo install -o root -g wheel -m 755 ms/runner/job-started.sh "$HOOK_DIR/job-started.sh"
+sudo install -o root -g wheel -m 755 ms/runner/sign.sh "$HOOK_DIR/sign.sh"
+RCODESIGN_TARBALL=$(mktemp /tmp/apple-codesign.XXXXXX)
+curl -fsSL -o "$RCODESIGN_TARBALL" \
+  "https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign/$RCODESIGN_VERSION/apple-codesign-$RCODESIGN_VERSION-macos-universal.tar.gz"
+echo "$RCODESIGN_SHA256  $RCODESIGN_TARBALL" | shasum -a 256 -c -
+RCODESIGN_DIR=$(mktemp -d /tmp/apple-codesign.XXXXXX)
+tar -xzf "$RCODESIGN_TARBALL" -C "$RCODESIGN_DIR"
+sudo install -o root -g wheel -m 755 "$RCODESIGN_DIR/apple-codesign-$RCODESIGN_VERSION-macos-universal/rcodesign" "$HOOK_DIR/rcodesign"
+rm -rf "$RCODESIGN_TARBALL" "$RCODESIGN_DIR"
+
+# A drop-in that fails to parse would break sudo for everyone on this Mac.
+visudo -cf ms/runner/sudoers
+sudo install -o root -g wheel -m 440 ms/runner/sudoers /etc/sudoers.d/herdr-signer
+if ! sudo visudo -c >/dev/null; then
+  sudo rm -f /etc/sudoers.d/herdr-signer
+  echo "sudo refused its configuration with the herdr-signer drop-in, so it is removed again." >&2
+  exit 1
+fi
 
 # The runner user's commands below cannot start from a directory in your home.
 REPO_ROOT=$PWD
@@ -97,18 +144,31 @@ sudo -u "$CI_USER" -H bash -c '
   rustup target add aarch64-apple-darwin x86_64-apple-darwin
 '
 
-# Release jobs sign with rcodesign from this file: a launchd daemon runs outside
-# any user session, where macOS refuses keychain signing.
+# The helper signs with rcodesign from the .p12 file, since a launchd daemon runs
+# outside any user session, where macOS refuses keychain signing.
+sudo install -d -o root -g wheel -m 700 "$KEY_DIR"
 if [ -n "$P12" ]; then
   read -r -s -p "Password of $P12: " P12_PASSWORD
   echo
-  sudo -u "$CI_USER" -H mkdir -p "$SIGNING_DIR"
-  sudo chmod 700 "$SIGNING_DIR"
-  sudo install -o "$CI_USER" -m 600 "$P12" "$SIGNING_P12"
-  printf '%s' "$P12_PASSWORD" | sudo -u "$CI_USER" -H tee "$SIGNING_P12_PASSWORD_FILE" >/dev/null
-  sudo chmod 600 "$SIGNING_P12_PASSWORD_FILE"
+  sudo install -o root -g wheel -m 600 "$P12" "$KEY_DIR/developer-id.p12"
+  printf '%s' "$P12_PASSWORD" | sudo sh -c 'umask 077; cat > "$1"' _ "$KEY_DIR/p12-password"
+elif sudo test -f "$OLD_SIGNING_DIR/developer-id.p12" && ! sudo test -f "$KEY_DIR/developer-id.p12"; then
+  # An older install kept the key in the runner user's home.
+  sudo mv "$OLD_SIGNING_DIR/developer-id.p12" "$OLD_SIGNING_DIR/p12-password" "$KEY_DIR/"
 fi
-sudo test -f "$SIGNING_P12" || { echo "The runner has no signing certificate yet: pass --p12." >&2; exit 1; }
+sudo rm -rf "$OLD_SIGNING_DIR"
+if [ -n "$NOTARY_KEY" ]; then
+  sudo "$HOOK_DIR/rcodesign" encode-app-store-connect-api-key -o "$KEY_DIR/notary-api-key.json" \
+    "$NOTARY_ISSUER" "$NOTARY_KEY_ID" "$NOTARY_KEY" >/dev/null
+fi
+for file in developer-id.p12 p12-password notary-api-key.json; do
+  sudo test -f "$KEY_DIR/$file" || {
+    echo "The runner has no $file yet: pass --p12 and the --notary-* flags (see ms/runner/README.md)." >&2; exit 1; }
+  sudo chown root:wheel "$KEY_DIR/$file"
+  sudo chmod 600 "$KEY_DIR/$file"
+done
+sudo -u "$CI_USER" sudo -n -l /usr/local/herdr-signer/sign.sh >/dev/null || {
+  echo "sudo does not let $CI_USER run $HOOK_DIR/sign.sh; check that /etc/sudoers includes /private/etc/sudoers.d." >&2; exit 1; }
 if sudo test -f "$OLD_KEYCHAIN"; then
   sudo -u "$CI_USER" -H security delete-keychain "$OLD_KEYCHAIN"
   sudo rm -f "$SIGNING_DIR/keychain-password"
@@ -144,8 +204,6 @@ sudo tee "$PLIST" >/dev/null <<PLIST
     <key>HOME</key><string>$CI_HOME</string>
     <key>PATH</key><string>$TOOL_PATH</string>
     <key>ACTIONS_RUNNER_HOOK_JOB_STARTED</key><string>$HOOK_DIR/job-started.sh</string>
-    <key>HERDR_SIGNING_P12</key><string>$SIGNING_P12</string>
-    <key>HERDR_SIGNING_P12_PASSWORD_FILE</key><string>$SIGNING_P12_PASSWORD_FILE</string>
   </dict>
 </dict>
 </plist>

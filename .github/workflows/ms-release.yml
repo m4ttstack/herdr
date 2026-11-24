@@ -75,22 +75,12 @@ jobs:
           ms/build.sh --arch arm64 --revision "${{ steps.version.outputs.revision }}" --out dist
           ms/build.sh --arch x86_64 --revision "${{ steps.version.outputs.revision }}" --out dist
 
-      - name: Sign
+      - name: Sign and notarize
         run: |
           set -euo pipefail
-          : "${HERDR_SIGNING_P12:?the runner has no signing certificate; see ms/runner/README.md}"
-          # The runner is a launchd daemon, outside any user session, where macOS
-          # refuses keychain signing; rcodesign signs from the .p12 file instead.
-          tarball="$RUNNER_TEMP/apple-codesign-0.29.0-macos-universal.tar.gz"
-          curl -fsSL -o "$tarball" \
-            https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign/0.29.0/apple-codesign-0.29.0-macos-universal.tar.gz
-          echo "d98372d5524226ccf9dc0eda03d4e4f5826182dabb2fc3f2bd303ed9113a748d  $tarball" | shasum -a 256 -c -
-          tar -xzf "$tarball" -C "$RUNNER_TEMP"
-          rcodesign="$RUNNER_TEMP/apple-codesign-0.29.0-macos-universal/rcodesign"
-          for asset in herdr-macos-aarch64 herdr-macos-x86_64; do
-            "$rcodesign" sign --p12-file "$HERDR_SIGNING_P12" --p12-password-file "$HERDR_SIGNING_P12_PASSWORD_FILE" \
-              --code-signature-flags runtime "dist/$asset"
-          done
+          # The key is root-only; the root-owned helper signs with hardened runtime
+          # and Apple's timestamp, then notarizes (ms/runner/README.md).
+          sudo -n /usr/local/herdr-signer/sign.sh "$PWD/dist/herdr-macos-aarch64" "$PWD/dist/herdr-macos-x86_64"
 
       - name: Verify signatures, architectures and version
         run: |
