@@ -580,6 +580,9 @@ impl RemoteAssetRef {
 #[derive(Deserialize)]
 struct RemoteUpdateManifest {
     version: String,
+    /// The `n` of a mattstack fork release `<version>-ms.<n>`; stock herdr manifests have none.
+    #[serde(default)]
+    fork_revision: Option<u32>,
     protocol: Option<u32>,
     assets: BTreeMap<String, RemoteAssetRef>,
     #[serde(default)]
@@ -633,6 +636,19 @@ where
 }
 
 impl RemoteUpdateManifest {
+    /// A fork manifest describes only its newest fork build, so a build matches
+    /// it only at the same fork revision, and never a stock manifest.
+    fn release_for_build(
+        &self,
+        version: &str,
+        fork_revision: Option<u32>,
+    ) -> Option<RemoteManifestReleaseRef<'_>> {
+        if self.fork_revision != fork_revision {
+            return None;
+        }
+        self.release_for_version(version)
+    }
+
     fn release_for_version(&self, version: &str) -> Option<RemoteManifestReleaseRef<'_>> {
         if self.version.trim_start_matches('v') == version {
             return Some(RemoteManifestReleaseRef {
@@ -2514,8 +2530,20 @@ fn preview_assets_for_build<'a>(
     Ok((build.protocol, &build.assets))
 }
 
+fn remote_release_manifest_url(fork: crate::build_info::Fork) -> Result<&'static str, String> {
+    use crate::build_info::Fork;
+    match fork {
+        Fork::None => Ok(STABLE_UPDATE_MANIFEST_URL),
+        Fork::Release => Ok(crate::update::FORK_UPDATE_MANIFEST_URL),
+        Fork::Unreleased => Err(format!(
+            "this herdr was built from the mattstack fork's source without ms/build.sh, so no release matches it; set {REMOTE_BINARY_ENV_VAR}=target/release/herdr or install herdr on the remote host manually"
+        )),
+    }
+}
+
 fn remote_release_asset(asset_key: &str) -> io::Result<RemoteReleaseAsset> {
-    if crate::build_info::is_preview() {
+    let fork = crate::build_info::fork();
+    if fork == crate::build_info::Fork::None && crate::build_info::is_preview() {
         let build_id = crate::build_info::build_id().ok_or_else(|| {
             io::Error::other("preview client has no build id; set HERDR_REMOTE_BINARY or install Herdr on the remote manually")
         })?;
@@ -2538,10 +2566,18 @@ fn remote_release_asset(asset_key: &str) -> io::Result<RemoteReleaseAsset> {
     }
 
     let current_version = current_version();
-    let manifest_bytes = fetch_remote_manifest(STABLE_UPDATE_MANIFEST_URL)?;
+    let manifest_url = remote_release_manifest_url(fork).map_err(io::Error::other)?;
+    let (manifest_version, fork_revision) = match fork {
+        crate::build_info::Fork::Release => (
+            crate::build_info::BASE_VERSION.to_string(),
+            crate::build_info::fork_revision(),
+        ),
+        _ => (current_version.clone(), None),
+    };
+    let manifest_bytes = fetch_remote_manifest(manifest_url)?;
     let manifest: RemoteUpdateManifest = serde_json::from_slice(&manifest_bytes)
         .map_err(|err| io::Error::other(format!("failed to parse update manifest JSON: {err}")))?;
-    let release = manifest.release_for_version(&current_version).ok_or_else(|| {
+    let release = manifest.release_for_build(&manifest_version, fork_revision).ok_or_else(|| {
         io::Error::other(format!(
             "release manifest does not include herdr {current_version}; build herdr for {} or install it there manually",
             asset_key
@@ -5379,6 +5415,52 @@ function Get-Process {
             .unwrap(),
             RemoteServerStatus::NotRunning
         );
+    }
+
+    #[test]
+    fn remote_installs_from_a_fork_release_read_the_fork_manifest() {
+        use crate::build_info::Fork;
+        assert_eq!(
+            remote_release_manifest_url(Fork::Release),
+            Ok(crate::update::FORK_UPDATE_MANIFEST_URL)
+        );
+        assert_eq!(
+            remote_release_manifest_url(Fork::None),
+            Ok(STABLE_UPDATE_MANIFEST_URL)
+        );
+        assert!(remote_release_manifest_url(Fork::Unreleased)
+            .is_err_and(|reason| reason.contains("HERDR_REMOTE_BINARY")));
+    }
+
+    #[test]
+    fn a_fork_manifest_matches_only_the_same_fork_revision() {
+        let manifest: RemoteUpdateManifest = serde_json::from_str(
+            r#"{
+                "version": "0.9.5",
+                "fork_revision": 2,
+                "assets": {
+                    "macos-aarch64": { "url": "https://example.com/ms2", "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+                }
+            }"#,
+        )
+        .unwrap();
+        assert!(manifest.release_for_build("0.9.5", Some(2)).is_some());
+        assert!(manifest.release_for_build("0.9.5", Some(1)).is_none());
+        assert!(manifest.release_for_build("0.9.5", None).is_none());
+    }
+
+    #[test]
+    fn a_stock_manifest_never_matches_a_fork_build() {
+        let manifest: RemoteUpdateManifest = serde_json::from_str(
+            r#"{
+                "version": "0.9.5",
+                "assets": { "macos-aarch64": "https://example.com/stock" },
+                "releases": { "0.9.5": { "assets": { "macos-aarch64": "https://example.com/archive" } } }
+            }"#,
+        )
+        .unwrap();
+        assert!(manifest.release_for_build("0.9.5", Some(1)).is_none());
+        assert!(manifest.release_for_build("0.9.5", None).is_some());
     }
 
     #[test]
