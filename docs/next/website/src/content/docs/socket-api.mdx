@@ -103,7 +103,7 @@ Raw socket method names use dot notation:
 | Workspace | `workspace.create`, `workspace.list`, `workspace.get`, `workspace.focus`, `workspace.rename`, `workspace.move`, `workspace.move_block`, `workspace.report_metadata`, `workspace.close` |
 | Worktree | `worktree.list`, `worktree.create`, `worktree.open`, `worktree.remove` |
 | Tab | `tab.create`, `tab.list`, `tab.get`, `tab.focus`, `tab.rename`, `tab.move`, `tab.close` |
-| Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.read`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
+| Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.read`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.report_blocker`, `pane.clear_blocker`, `pane.close`, `pane.wait_for_output` |
 | Popup | `popup.close` |
 | Layout | `layout.export`, `layout.apply`, `layout.set_split_ratio` |
 | Agent | `agent.list`, `agent.get`, `agent.read`, `agent.explain`, `agent.send_keys`, `agent.prompt`, `agent.wait`, `agent.rename`, `agent.focus`, `agent.start`, `agent.view.set`, `agent.view.clear` |
@@ -723,6 +723,15 @@ If no native session reference is stored, the field is omitted.
 `pane.get`, `pane.list`, `agent.get`, and `agent.list` also expose `foreground_cwd` when Herdr can resolve the cwd of the process currently controlling the pane PTY. The existing `cwd` field remains the pane/workspace cwd used for labels, follow-cwd behavior, and restored session state.
 
 `PaneInfo` and `AgentInfo` expose optional `terminal_title` and `terminal_title_stripped` fields. `terminal_title` is the latest OSC 0/2 title after safety normalization. `terminal_title_stripped` removes one recognized leading activity or spinner glyph and following whitespace. These server-owned values are ephemeral across a cold restart and are independent of the metadata `title` and semantic agent state.
+
+A tool other than the agent's integration can hold an idle pane blocked while it waits on a person, such as a form the agent opened. Native integrations such as `herdr:claude` cannot report `blocked` through `pane.report_agent`, so these methods overlay whatever state Herdr already derives:
+
+```json
+{"id":"req_4","method":"pane.report_blocker","params":{"pane_id":"w1:p1","source":"mattstack:gate","message":"Plan review"}}
+{"id":"req_5","method":"pane.clear_blocker","params":{"pane_id":"w1:p1","source":"mattstack:gate"}}
+```
+
+While any source holds a blocker, an idle pane is `blocked` for waits, notifications, rollups, and `pane.agent_status_changed`; working, blocked, and unknown states are unchanged. `message` is optional and becomes the `blocked` state label unless metadata already supplies one; it is normalized like other presentation text. Each `source` holds one blocker, and a repeat report replaces it. Clearing a source that holds no blocker succeeds and changes nothing, and clearing the last blocker does not count as the agent finishing. An empty `source` fails with `invalid_blocker_source`, and a report on a pane with no agent succeeds and changes nothing. Blockers end when their source clears them, a non-native integration releases the agent with `pane.release_agent`, the agent's process exits, or the pane respawns or closes, and they are not restored after a server restart. While a pane is blocked, `agent.prompt` answers `agent_blocked`.
 
 Use `pane.report_metadata` when a user hook wants to customize presentation without taking over lifecycle state from a Herdr integration.
 

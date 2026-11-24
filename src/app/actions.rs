@@ -1617,6 +1617,23 @@ impl AppState {
                     .collect()
                 }
             }
+            AppEvent::ExternalBlockerReported {
+                pane_id,
+                source,
+                message,
+            } => self
+                .update_terminal_state(pane_id, |terminal| {
+                    terminal.set_external_blocker(&source, message)
+                })
+                .into_iter()
+                .collect(),
+            // The tool, not the agent, lifted the block; the agent did not finish a turn.
+            AppEvent::ExternalBlockerCleared { pane_id, source } => self
+                .update_terminal_state_with_completion_policy(pane_id, true, |terminal| {
+                    terminal.clear_external_blocker(&source)
+                })
+                .into_iter()
+                .collect(),
             // Host-local effects are intercepted by HeadlessServer and forwarded to the
             // foreground client; they never touch AppState. Kept for AppEvent exhaustiveness.
             AppEvent::TerminalBell { .. } => Vec::new(),
@@ -4018,6 +4035,102 @@ mod tests {
         assert_eq!(terminal.agent_name.as_deref(), Some("reviewer"));
         assert!(terminal.full_lifecycle_hook_authority_active());
         assert!(!state.session_dirty);
+    }
+
+    fn report_screen_state(state: &mut AppState, pane_id: PaneId, agent_state: AgentState) {
+        state.handle_app_event(AppEvent::StateChanged {
+            pane_id,
+            agent: Some(Agent::Claude),
+            state: agent_state,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: Instant::now(),
+        });
+    }
+
+    #[test]
+    fn external_blocker_blocks_screen_detected_claude_pane_and_emits_status_change() {
+        let mut state = app_with_workspaces(&["active"]);
+        let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
+        let terminal_id = state.workspaces[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        report_screen_state(&mut state, pane_id, AgentState::Idle);
+        assert_eq!(state.terminals[&terminal_id].state, AgentState::Idle);
+
+        let updates = state.handle_app_event(AppEvent::ExternalBlockerReported {
+            pane_id,
+            source: "mattstack:gate".into(),
+            message: Some("Plan review".into()),
+        });
+
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].previous_state, AgentState::Idle);
+        assert_eq!(updates[0].state, AgentState::Blocked);
+        assert_eq!(
+            updates[0]
+                .presentation
+                .state_labels
+                .get("blocked")
+                .map(String::as_str),
+            Some("Plan review")
+        );
+        assert_eq!(state.terminals[&terminal_id].state, AgentState::Blocked);
+
+        let updates = state.handle_app_event(AppEvent::ExternalBlockerCleared {
+            pane_id,
+            source: "mattstack:gate".into(),
+        });
+
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].state, AgentState::Idle);
+        assert!(updates[0].presentation.state_labels.is_empty());
+        assert_eq!(state.terminals[&terminal_id].state, AgentState::Idle);
+    }
+
+    #[test]
+    fn clearing_external_blocker_is_not_an_agent_completion() {
+        let mut state = app_with_workspaces(&["active", "background"]);
+        let pane_id = *state.workspaces[1].panes.keys().next().unwrap();
+        report_screen_state(&mut state, pane_id, AgentState::Idle);
+        state.handle_app_event(AppEvent::ExternalBlockerReported {
+            pane_id,
+            source: "mattstack:gate".into(),
+            message: None,
+        });
+
+        let updates = state.handle_app_event(AppEvent::ExternalBlockerCleared {
+            pane_id,
+            source: "mattstack:gate".into(),
+        });
+
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].state, AgentState::Idle);
+        assert!(updates[0].seen);
+        assert!(state.workspaces[1].pane_state(pane_id).unwrap().seen);
+    }
+
+    #[test]
+    fn external_blocker_report_for_unknown_pane_is_ignored() {
+        let mut state = app_with_workspaces(&["active"]);
+
+        let reported = state.handle_app_event(AppEvent::ExternalBlockerReported {
+            pane_id: PaneId::from_raw(9999),
+            source: "mattstack:gate".into(),
+            message: Some("Plan review".into()),
+        });
+        let cleared = state.handle_app_event(AppEvent::ExternalBlockerCleared {
+            pane_id: PaneId::from_raw(9999),
+            source: "mattstack:gate".into(),
+        });
+
+        assert!(reported.is_empty());
+        assert!(cleared.is_empty());
+        assert!(state
+            .terminals
+            .values()
+            .all(|terminal| terminal.external_blockers.is_empty()));
     }
 
     #[test]

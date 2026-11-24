@@ -445,6 +445,22 @@ pub struct PaneReleaseAgentParams {
     pub seq: Option<u64>,
 }
 
+/// Shows an idle pane as blocked while a tool other than the agent's
+/// integration waits on a person. Each source holds at most one blocker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneReportBlockerParams {
+    pub pane_id: String,
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneClearBlockerParams {
+    pub pane_id: String,
+    pub source: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneInfo {
     pub pane_id: String,

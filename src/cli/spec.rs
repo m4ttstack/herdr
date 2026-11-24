@@ -639,6 +639,19 @@ fn pane_command() -> Command {
         .subcommand(report_agent_session_command())
         .subcommand(release_agent_command())
         .subcommand(report_metadata_command())
+        .subcommand(
+            Command::new("report-blocker")
+                .about("Show the pane as blocked while a tool waits on a person")
+                .arg(required("pane_id", "PANE_ID"))
+                .arg(option("source", "ID").required(true))
+                .arg(option("message", "TEXT")),
+        )
+        .subcommand(
+            Command::new("clear-blocker")
+                .about("Lift a tool's blocker from the pane")
+                .arg(required("pane_id", "PANE_ID"))
+                .arg(option("source", "ID").required(true)),
+        )
 }
 
 fn report_agent_command() -> Command {
@@ -1184,6 +1197,8 @@ mod tests {
             ),
             (&["pane", "release-agent"][..], &["source", "agent"][..]),
             (&["pane", "report-metadata"][..], &["source"][..]),
+            (&["pane", "report-blocker"][..], &["source"][..]),
+            (&["pane", "clear-blocker"][..], &["source"][..]),
         ] {
             let cmd = command_path(&super::command(), path).clone();
             for option in options {

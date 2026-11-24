@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -135,6 +135,8 @@ pub struct TerminalState {
     fallback_observed_at: Option<Instant>,
     pub hook_authority: Option<HookAuthority>,
     pub agent_metadata: HashMap<String, AgentMetadata>,
+    /// Blockers raised by tools other than the agent's integration, by source.
+    pub external_blockers: BTreeMap<String, Option<String>>,
     pub metadata_tokens: crate::metadata_tokens::MetadataTokens,
     pub persisted_agent_session: Option<crate::agent_resume::PersistedAgentSession>,
     reported_resume: Option<crate::agent_resume::ReportedAgentResume>,
@@ -175,6 +177,7 @@ impl TerminalState {
             fallback_observed_at: None,
             hook_authority: None,
             agent_metadata: HashMap::new(),
+            external_blockers: BTreeMap::new(),
             metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),
             persisted_agent_session: None,
             reported_resume: None,
@@ -548,6 +551,7 @@ impl TerminalState {
                 self.hook_report_sequences.remove(&source);
                 self.hook_authority = None;
             }
+            self.external_blockers.clear();
             if !newer_custom_authority
                 && self
                     .persisted_agent_session
@@ -1856,6 +1860,7 @@ impl TerminalState {
             self.clear_agent_name();
         }
         self.hook_authority = None;
+        self.external_blockers.clear();
         self.forget_reported_resume_of(source, agent_label);
         if !preserve_foreign_persisted_session {
             self.persisted_agent_session = None;
@@ -1871,6 +1876,50 @@ impl TerminalState {
             ),
             session_ref_changed: previous_session != current_session,
             agent_released: !process_owns_agent,
+        })
+    }
+
+    pub fn set_external_blocker(
+        &mut self,
+        source: &str,
+        message: Option<String>,
+    ) -> Option<TerminalStateMutation> {
+        // Nothing would lift a blocker stored here: a process exit is only seen for a detected agent.
+        self.effective_agent_label()?;
+        self.mutate_external_blockers(|blockers| {
+            blockers.insert(source.to_string(), message);
+        })
+    }
+
+    pub fn clear_external_blocker(&mut self, source: &str) -> Option<TerminalStateMutation> {
+        if !self.external_blockers.contains_key(source) {
+            return None;
+        }
+        self.mutate_external_blockers(|blockers| {
+            blockers.remove(source);
+        })
+    }
+
+    fn mutate_external_blockers(
+        &mut self,
+        mutate: impl FnOnce(&mut BTreeMap<String, Option<String>>),
+    ) -> Option<TerminalStateMutation> {
+        let now = Instant::now();
+        let previous_agent_label = self.effective_agent_label().map(str::to_string);
+        let previous_known_agent = self.effective_known_agent();
+        let previous_state = self.state;
+        let previous_presentation = self.effective_presentation_for_state_at(previous_state, now);
+        mutate(&mut self.external_blockers);
+        Some(TerminalStateMutation {
+            effective_state_change: self.recompute_effective_state(
+                previous_agent_label,
+                previous_known_agent,
+                previous_state,
+                previous_presentation,
+                now,
+            ),
+            session_ref_changed: false,
+            agent_released: false,
         })
     }
 
@@ -2332,6 +2381,7 @@ impl TerminalState {
         self.hook_authority = None;
         self.persisted_agent_session = None;
         self.agent_metadata.clear();
+        self.external_blockers.clear();
         self.metadata_report_agents.clear();
         self.suppressed_full_lifecycle_hook_reports.clear();
         self.stale_full_lifecycle_hook_sessions.clear();
@@ -2409,7 +2459,7 @@ impl TerminalState {
         previous_presentation: EffectivePresentation,
         now: Instant,
     ) -> Option<EffectiveStateChange> {
-        let state = if self.visible_blocker_overrides_hook() {
+        let mut state = if self.visible_blocker_overrides_hook() {
             AgentState::Blocked
         } else {
             self.hook_authority
@@ -2418,6 +2468,9 @@ impl TerminalState {
                 .map(|authority| authority.state)
                 .unwrap_or(self.fallback_state)
         };
+        if state == AgentState::Idle && !self.external_blockers.is_empty() {
+            state = AgentState::Blocked;
+        }
         let agent_label = self.effective_agent_label().map(str::to_string);
         let known_agent = self.effective_known_agent();
 
@@ -6416,5 +6469,244 @@ mod tests {
             terminal.hook_authority.as_ref().unwrap().source,
             "custom:pi"
         );
+    }
+
+    fn effective_blocked_label(terminal: &TerminalState) -> Option<String> {
+        terminal
+            .effective_presentation_for_state_at(terminal.state, Instant::now())
+            .state_labels
+            .get("blocked")
+            .cloned()
+    }
+
+    #[test]
+    fn external_blocker_turns_idle_into_blocked() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
+
+        let mutation = terminal
+            .set_external_blocker("mattstack:gate", Some("Plan review".into()))
+            .expect("blocker should change the effective state");
+
+        assert_eq!(terminal.state, AgentState::Blocked);
+        let change = mutation.effective_state_change.expect("state change");
+        assert_eq!(change.previous_state, AgentState::Idle);
+        assert_eq!(change.state, AgentState::Blocked);
+        assert_eq!(
+            effective_blocked_label(&terminal).as_deref(),
+            Some("Plan review")
+        );
+    }
+
+    #[test]
+    fn working_wins_over_external_blocker_and_blocked_returns_on_idle() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
+        terminal.set_external_blocker("mattstack:gate", None);
+        assert_eq!(terminal.state, AgentState::Blocked);
+
+        terminal.set_detected_state(Some(Agent::Claude), AgentState::Working);
+        assert_eq!(terminal.state, AgentState::Working);
+
+        terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
+        assert_eq!(terminal.state, AgentState::Blocked);
+    }
+
+    #[test]
+    fn clearing_last_external_blocker_restores_idle() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
+        terminal.set_external_blocker("a", Some("first".into()));
+        terminal.set_external_blocker("b", Some("second".into()));
+
+        terminal.clear_external_blocker("a");
+        assert_eq!(terminal.state, AgentState::Blocked);
+        assert_eq!(
+            effective_blocked_label(&terminal).as_deref(),
+            Some("second")
+        );
+
+        let mutation = terminal
+            .clear_external_blocker("b")
+            .expect("clearing the last blocker should be accepted");
+        assert_eq!(terminal.state, AgentState::Idle);
+        assert_eq!(
+            mutation.effective_state_change.map(|change| change.state),
+            Some(AgentState::Idle)
+        );
+        assert_eq!(effective_blocked_label(&terminal), None);
+    }
+
+    #[test]
+    fn clearing_an_unknown_blocker_source_changes_nothing() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
+        terminal.set_external_blocker("a", None);
+
+        assert!(terminal.clear_external_blocker("b").is_none());
+        assert_eq!(terminal.state, AgentState::Blocked);
+        assert_eq!(terminal.external_blockers.len(), 1);
+    }
+
+    #[test]
+    fn external_blocker_on_a_pane_with_no_agent_is_ignored() {
+        let mut terminal = test_terminal();
+
+        assert!(terminal
+            .set_external_blocker("mattstack:gate", Some("Plan review".into()))
+            .is_none());
+
+        assert!(terminal.external_blockers.is_empty());
+        assert_eq!(terminal.state, AgentState::Unknown);
+        terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
+        assert_eq!(terminal.state, AgentState::Idle);
+    }
+
+    #[test]
+    fn external_blocker_is_kept_while_a_detected_agent_reads_unknown() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Claude), AgentState::Unknown);
+
+        terminal.set_external_blocker("mattstack:gate", Some("Plan review".into()));
+
+        assert!(terminal.external_blockers.contains_key("mattstack:gate"));
+        terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
+        assert_eq!(terminal.state, AgentState::Blocked);
+    }
+
+    #[test]
+    fn external_blocker_is_kept_for_a_hook_reported_agent() {
+        let mut terminal = test_terminal();
+        terminal.set_hook_authority(
+            "custom:blocker-test".into(),
+            "blocker-test".into(),
+            AgentState::Idle,
+            None,
+            Some(1),
+        );
+
+        terminal.set_external_blocker("mattstack:gate", None);
+
+        assert!(terminal.external_blockers.contains_key("mattstack:gate"));
+        assert_eq!(terminal.state, AgentState::Blocked);
+    }
+
+    #[test]
+    fn metadata_blocked_label_wins_over_external_blocker_message() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
+        terminal.set_agent_metadata(AgentMetadataReport {
+            source: "custom:labels".into(),
+            agent_label: None,
+            applies_to_source: None,
+            title: None,
+            display_agent: None,
+            state_labels: HashMap::from([("blocked".into(), "needs a decision".into())]),
+            clear_title: false,
+            clear_display_agent: false,
+            clear_state_labels: false,
+            ttl: None,
+            seq: None,
+        });
+
+        terminal.set_external_blocker("mattstack:gate", Some("Plan review".into()));
+
+        assert_eq!(terminal.state, AgentState::Blocked);
+        assert_eq!(
+            effective_blocked_label(&terminal).as_deref(),
+            Some("needs a decision")
+        );
+    }
+
+    #[test]
+    fn release_agent_clears_external_blockers() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        terminal.set_hook_authority(
+            "custom:pi".into(),
+            "pi".into(),
+            AgentState::Idle,
+            None,
+            Some(10),
+        );
+        assert!(terminal.hook_authority.is_some());
+        terminal.set_external_blocker("mattstack:gate", None);
+        assert_eq!(terminal.state, AgentState::Blocked);
+
+        terminal
+            .release_agent_with_mutation("custom:pi", "pi", Some(11))
+            .expect("custom release should be accepted");
+
+        assert!(terminal.external_blockers.is_empty());
+        assert_ne!(terminal.state, AgentState::Blocked);
+    }
+
+    #[test]
+    fn process_exit_clears_external_blockers() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
+        terminal.set_external_blocker("mattstack:gate", Some("Plan review".into()));
+        assert_eq!(terminal.state, AgentState::Blocked);
+
+        terminal.set_detected_state_with_visible_blocker(
+            Some(Agent::Claude),
+            AgentState::Idle,
+            false,
+            false,
+            true,
+        );
+
+        assert!(terminal.external_blockers.is_empty());
+        assert_ne!(terminal.state, AgentState::Blocked);
+    }
+
+    #[test]
+    fn process_exit_clears_external_blockers_under_a_newer_custom_authority() {
+        let mut terminal = test_terminal();
+        let observed = Instant::now();
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Idle,
+            false,
+            false,
+            false,
+            false,
+            observed,
+        );
+        terminal.set_hook_authority_at(
+            "custom:pi".into(),
+            "pi".into(),
+            AgentState::Idle,
+            None,
+            None,
+            Some(100),
+            observed + Duration::from_secs(1),
+        );
+        terminal.set_external_blocker("mattstack:gate", Some("Plan review".into()));
+        assert_eq!(terminal.state, AgentState::Blocked);
+
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Idle,
+            false,
+            false,
+            false,
+            true,
+            observed,
+        );
+
+        assert!(terminal.external_blockers.is_empty());
+        assert_eq!(terminal.state, AgentState::Idle);
+    }
+
+    #[test]
+    fn respawn_reset_clears_external_blockers() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
+        terminal.set_external_blocker("mattstack:gate", None);
+
+        terminal.clear_agent_runtime_identity_after_respawn();
+
+        assert!(terminal.external_blockers.is_empty());
     }
 }

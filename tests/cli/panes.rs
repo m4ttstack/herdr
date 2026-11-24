@@ -638,6 +638,145 @@ fn pane_agent_reports_accept_options_before_pane() {
 }
 
 #[test]
+fn pane_report_blocker_and_clear_blocker_round_trip() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+
+    let herdr = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let created = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"req_blocker_1","method":"workspace.create","params":{{"cwd":"{}","focus":true}}}}"#,
+            base.display()
+        ),
+    );
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let idle = run_cli(
+        &socket_path,
+        &[
+            "pane",
+            "report-agent",
+            &pane_id,
+            "--source",
+            "custom:blocker-test",
+            "--agent",
+            "blocker-test",
+            "--state",
+            "idle",
+        ],
+    );
+    assert!(
+        idle.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&idle.stderr)
+    );
+
+    let reported = run_cli(
+        &socket_path,
+        &[
+            "pane",
+            "report-blocker",
+            &pane_id,
+            "--source",
+            "mattstack:gate",
+            "--message",
+            "Plan review",
+        ],
+    );
+    assert!(
+        reported.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&reported.stderr)
+    );
+    assert!(reported.stdout.is_empty());
+
+    let agent = run_cli_json(&socket_path, &["agent", "get", &pane_id]);
+    assert_eq!(agent["result"]["agent"]["agent_status"], "blocked");
+
+    let waited = run_cli(
+        &socket_path,
+        &[
+            "agent",
+            "wait",
+            &pane_id,
+            "--until",
+            "blocked",
+            "--timeout",
+            "1000",
+        ],
+    );
+    assert!(
+        waited.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&waited.stderr)
+    );
+    let waited: serde_json::Value = serde_json::from_slice(&waited.stdout).unwrap();
+    assert_eq!(waited["result"]["agent"]["agent_status"], "blocked");
+
+    let cleared = run_cli(
+        &socket_path,
+        &[
+            "pane",
+            "clear-blocker",
+            &pane_id,
+            "--source",
+            "mattstack:gate",
+        ],
+    );
+    assert!(
+        cleared.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&cleared.stderr)
+    );
+    let agent = run_cli_json(&socket_path, &["agent", "get", &pane_id]);
+    assert_ne!(agent["result"]["agent"]["agent_status"], "blocked");
+
+    let cleared_again = run_cli(
+        &socket_path,
+        &[
+            "pane",
+            "clear-blocker",
+            &pane_id,
+            "--source",
+            "mattstack:gate",
+        ],
+    );
+    assert!(
+        cleared_again.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&cleared_again.stderr)
+    );
+
+    let blank_source = run_cli(
+        &socket_path,
+        &["pane", "report-blocker", &pane_id, "--source", "  "],
+    );
+    assert!(!blank_source.status.success());
+
+    let unknown_pane = run_cli(
+        &socket_path,
+        &[
+            "pane",
+            "report-blocker",
+            "w99:p99",
+            "--source",
+            "mattstack:gate",
+        ],
+    );
+    assert!(!unknown_pane.status.success());
+
+    cleanup_spawned_herdr(herdr, base);
+}
+
+#[test]
 fn pane_read_rejects_invalid_value_with_usage_error() {
     // Invalid option values fail as CLI usage errors before any server
     // contact: exit 2 with the plain parser message, not the old

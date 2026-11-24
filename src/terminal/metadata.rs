@@ -394,7 +394,7 @@ impl TerminalState {
 
     fn effective_presentation_for_state_at_with_ttl(
         &self,
-        _state: AgentState,
+        state: AgentState,
         now: Instant,
         enforce_ttl: bool,
     ) -> EffectivePresentation {
@@ -402,6 +402,14 @@ impl TerminalState {
         presentation.title = self.newest_metadata_title(now, enforce_ttl);
         presentation.display_agent = self.newest_metadata_display_agent(now, enforce_ttl);
         presentation.state_labels = self.effective_metadata_state_labels(now, enforce_ttl);
+        if state == AgentState::Blocked {
+            if let Some(message) = self.external_blockers.values().flatten().next() {
+                presentation
+                    .state_labels
+                    .entry("blocked".to_string())
+                    .or_insert_with(|| message.clone());
+            }
+        }
         presentation
     }
 

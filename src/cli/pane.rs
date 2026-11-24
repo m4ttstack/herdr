@@ -1,12 +1,12 @@
 use crate::api::schema::{
-    Method, OutputMatch, PaneCurrentParams, PaneDirection, PaneEdgesParams,
+    Method, OutputMatch, PaneClearBlockerParams, PaneCurrentParams, PaneDirection, PaneEdgesParams,
     PaneFocusDirectionParams, PaneInputSetParams, PaneLayoutParams, PaneListParams,
     PaneMoveDestination, PaneMoveParams, PaneNeighborParams, PaneProcessInfoParams, PaneReadParams,
     PaneReleaseAgentParams, PaneRenameParams, PaneReportAgentParams, PaneReportAgentSessionParams,
-    PaneReportMetadataParams, PaneResizeParams, PaneRightClickTarget, PaneSendInputParams,
-    PaneSendKeysParams, PaneSendTextParams, PaneSplitParams, PaneSwapParams, PaneTarget,
-    PaneWaitForOutputParams, PaneZoomMode, PaneZoomParams, ReadFormat, ReadSource, Request,
-    SplitDirection,
+    PaneReportBlockerParams, PaneReportMetadataParams, PaneResizeParams, PaneRightClickTarget,
+    PaneSendInputParams, PaneSendKeysParams, PaneSendTextParams, PaneSplitParams, PaneSwapParams,
+    PaneTarget, PaneWaitForOutputParams, PaneZoomMode, PaneZoomParams, ReadFormat, ReadSource,
+    Request, SplitDirection,
 };
 
 pub(super) fn run_pane_command(args: &[String]) -> std::io::Result<i32> {
@@ -40,6 +40,8 @@ pub(super) fn run_pane_command(args: &[String]) -> std::io::Result<i32> {
         "report-agent-session" => pane_report_agent_session(&args[1..]),
         "release-agent" => pane_release_agent(&args[1..]),
         "report-metadata" => pane_report_metadata(&args[1..]),
+        "report-blocker" => pane_report_blocker(&args[1..]),
+        "clear-blocker" => pane_clear_blocker(&args[1..]),
         "run" => pane_run(&args[1..]),
         "help" | "--help" | "-h" => {
             print_pane_help();
@@ -1478,6 +1480,99 @@ fn pane_release_agent(args: &[String]) -> std::io::Result<i32> {
     }))
 }
 
+const REPORT_BLOCKER_USAGE: &str =
+    "usage: herdr pane report-blocker <pane_id> --source ID [--message TEXT]";
+const CLEAR_BLOCKER_USAGE: &str = "usage: herdr pane clear-blocker <pane_id> --source ID";
+
+fn pane_report_blocker(args: &[String]) -> std::io::Result<i32> {
+    let Some((pane_id, source, message)) =
+        parse_pane_blocker_args(args, REPORT_BLOCKER_USAGE, true)
+    else {
+        return Ok(2);
+    };
+    super::send_ok_request(Method::PaneReportBlocker(PaneReportBlockerParams {
+        pane_id,
+        source,
+        message,
+    }))
+}
+
+fn pane_clear_blocker(args: &[String]) -> std::io::Result<i32> {
+    let Some((pane_id, source, _)) = parse_pane_blocker_args(args, CLEAR_BLOCKER_USAGE, false)
+    else {
+        return Ok(2);
+    };
+    super::send_ok_request(Method::PaneClearBlocker(PaneClearBlockerParams {
+        pane_id,
+        source,
+    }))
+}
+
+type PaneBlockerArgs = (String, String, Option<String>);
+
+fn parse_pane_blocker_args(
+    args: &[String],
+    usage: &str,
+    accepts_message: bool,
+) -> Option<PaneBlockerArgs> {
+    let value_options: &[&str] = if accepts_message {
+        &["--source", "--message"]
+    } else {
+        &["--source"]
+    };
+    let args = super::expand_equals_args(args, value_options);
+    let mut pane_id = None;
+    let mut source = None;
+    let mut message = None;
+
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--source" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --source");
+                    return None;
+                };
+                source = Some(value.clone());
+                index += 2;
+            }
+            "--message" if accepts_message => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --message");
+                    return None;
+                };
+                message = Some(value.clone());
+                index += 2;
+            }
+            option if option.starts_with('-') => {
+                eprintln!("unknown option: {option}");
+                return None;
+            }
+            positional => {
+                if pane_id.is_some() {
+                    eprintln!("unexpected argument: {positional}");
+                    return None;
+                }
+                pane_id = Some(super::normalize_pane_id(positional));
+                index += 1;
+            }
+        }
+    }
+
+    let Some(pane_id) = pane_id else {
+        eprintln!("{usage}");
+        return None;
+    };
+    let Some(source) = source.and_then(|source| {
+        let source = source.trim().to_string();
+        (!source.is_empty()).then_some(source)
+    }) else {
+        eprintln!("missing required --source");
+        return None;
+    };
+    Some((pane_id, source, message))
+}
+
 fn pane_report_metadata(args: &[String]) -> std::io::Result<i32> {
     let Some(raw_pane_id) = args.first() else {
         eprintln!("usage: herdr pane report-metadata <pane_id> --source ID [--agent LABEL] [--applies-to-source ID] [--title TEXT|--clear-title] [--display-agent TEXT|--clear-display-agent] [--state-label STATUS=TEXT] [--clear-state-labels] [--token NAME=VALUE] [--clear-token NAME] [--seq N] [--ttl-ms N]");
@@ -1702,6 +1797,8 @@ fn print_pane_help() {
     eprintln!("  herdr pane report-agent-session <pane_id> --source ID --agent LABEL [--seq N] [--agent-session-id ID] [--agent-session-path PATH]");
     eprintln!("  herdr pane release-agent <pane_id> --source ID --agent LABEL [--seq N]");
     eprintln!("  herdr pane report-metadata <pane_id> --source ID [--agent LABEL] [--applies-to-source ID] [--title TEXT|--clear-title] [--display-agent TEXT|--clear-display-agent] [--state-label STATUS=TEXT] [--clear-state-labels] [--token NAME=VALUE] [--clear-token NAME] [--seq N] [--ttl-ms N]");
+    eprintln!("  herdr pane report-blocker <pane_id> --source ID [--message TEXT]");
+    eprintln!("  herdr pane clear-blocker <pane_id> --source ID");
     eprintln!("  herdr pane run <pane_id> <command>");
 }
 
@@ -1711,6 +1808,126 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    fn report(values: &[&str]) -> Option<PaneBlockerArgs> {
+        parse_pane_blocker_args(&args(values), REPORT_BLOCKER_USAGE, true)
+    }
+
+    fn clear(values: &[&str]) -> Option<PaneBlockerArgs> {
+        parse_pane_blocker_args(&args(values), CLEAR_BLOCKER_USAGE, false)
+    }
+
+    #[test]
+    fn parse_pane_blocker_args_reads_the_gate_form_raise() {
+        assert_eq!(
+            report(&[
+                "w1:p2",
+                "--source",
+                "mattstack:gate",
+                "--message",
+                "plan-review, 1 more waiting"
+            ]),
+            Some((
+                "w1:p2".into(),
+                "mattstack:gate".into(),
+                Some("plan-review, 1 more waiting".into())
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_pane_blocker_args_reads_the_gate_form_clear() {
+        assert_eq!(
+            clear(&["w1:p2", "--source", "mattstack:gate"]),
+            Some(("w1:p2".into(), "mattstack:gate".into(), None))
+        );
+    }
+
+    #[test]
+    fn parse_pane_blocker_args_takes_a_message_that_starts_with_a_dash() {
+        assert_eq!(
+            report(&[
+                "w1:p2",
+                "--source",
+                "mattstack:gate",
+                "--message",
+                "-2 checks failing"
+            ]),
+            Some((
+                "w1:p2".into(),
+                "mattstack:gate".into(),
+                Some("-2 checks failing".into())
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_pane_blocker_args_accepts_equals_values() {
+        assert_eq!(
+            report(&["w1:p2", "--source=mattstack:gate", "--message=a=b"]),
+            Some(("w1:p2".into(), "mattstack:gate".into(), Some("a=b".into())))
+        );
+        assert_eq!(
+            clear(&["--source=mattstack:gate", "w1:p2"]),
+            Some(("w1:p2".into(), "mattstack:gate".into(), None))
+        );
+    }
+
+    #[test]
+    fn parse_pane_blocker_args_requires_a_source() {
+        assert_eq!(report(&["w1:p2", "--message", "plan-review"]), None);
+        assert_eq!(clear(&["w1:p2"]), None);
+        assert_eq!(clear(&["w1:p2", "--source", "  "]), None);
+        assert_eq!(clear(&["w1:p2", "--source"]), None);
+    }
+
+    #[test]
+    fn parse_pane_blocker_args_requires_one_pane() {
+        assert_eq!(clear(&["--source", "mattstack:gate"]), None);
+        assert_eq!(
+            clear(&["w1:p2", "w1:p3", "--source", "mattstack:gate"]),
+            None
+        );
+        assert_eq!(
+            report(&["w1:p2", "--source", "mattstack:gate", "--message", "a", "b"]),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_pane_blocker_args_refuses_a_message_on_clear() {
+        assert_eq!(
+            clear(&[
+                "w1:p2",
+                "--source",
+                "mattstack:gate",
+                "--message",
+                "plan-review"
+            ]),
+            None
+        );
+        assert_eq!(
+            clear(&[
+                "w1:p2",
+                "--source",
+                "mattstack:gate",
+                "--message=plan-review"
+            ]),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_pane_blocker_args_refuses_an_unknown_option() {
+        assert_eq!(
+            report(&["w1:p2", "--source", "mattstack:gate", "--json"]),
+            None
+        );
+        assert_eq!(
+            clear(&["w1:p2", "--source", "mattstack:gate", "--seq", "3"]),
+            None
+        );
     }
 
     #[test]

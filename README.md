@@ -8,6 +8,7 @@ A fork of [herdrdev/herdr](https://github.com/herdrdev/herdr) 0.9.5 that mattsta
 - **Host theme.** `terminal.host_theme` on terminal session control, so panes follow the host app's light or dark theme.
 - **Theme timing and live-handoff restart.** Agents resume with the host theme once its whole theme line has landed, and the theme survives a live handoff to a new server.
 - **Kitty images.** Kitty graphics images reach session-control clients in terminal frames.
+- **Gate blocked state.** `herdr pane report-blocker` and `clear-blocker` let a tool other than the agent's integration show a pane as blocked while it waits on a person, such as a mattstack gate form.
 - **Updates come from this fork.** `herdr update` installs only this fork's releases, never stock herdr. There is no preview channel.
 
 ## Installation

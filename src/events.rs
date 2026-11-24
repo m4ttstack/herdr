@@ -162,6 +162,14 @@ pub enum AppEvent {
         known_agent: Option<Agent>,
         seq: Option<u64>,
     },
+    /// A tool other than the agent's integration is waiting on a person.
+    ExternalBlockerReported {
+        pane_id: PaneId,
+        source: String,
+        message: Option<String>,
+    },
+    /// A tool's outside blocker no longer holds the pane.
+    ExternalBlockerCleared { pane_id: PaneId, source: String },
     /// A new version is available through the active installation manager.
     UpdateReady {
         version: String,

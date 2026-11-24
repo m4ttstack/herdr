@@ -1,15 +1,15 @@
 use bytes::Bytes;
 
 use crate::api::schema::{
-    EventData, EventEnvelope, EventKind, PaneClearAgentAuthorityParams, PaneCopyMotion,
-    PaneCopyMotionParams, PaneCopySearchDirection, PaneCopySearchParams, PaneCurrentParams,
-    PaneDirection, PaneEdgesParams, PaneEdgesResult, PaneFocusDirectionParams,
+    EventData, EventEnvelope, EventKind, PaneClearAgentAuthorityParams, PaneClearBlockerParams,
+    PaneCopyMotion, PaneCopyMotionParams, PaneCopySearchDirection, PaneCopySearchParams,
+    PaneCurrentParams, PaneDirection, PaneEdgesParams, PaneEdgesResult, PaneFocusDirectionParams,
     PaneFocusDirectionReason, PaneFocusDirectionResult, PaneInfo, PaneInputSetParams,
     PaneLayoutPane, PaneLayoutParams, PaneLayoutRect, PaneLayoutSnapshot, PaneLayoutSplit,
     PaneListParams, PaneMoveDestination, PaneMoveParams, PaneMoveReason, PaneMoveResult,
     PaneNeighborParams, PaneNeighborResult, PaneProcessInfo, PaneProcessInfoParams,
     PaneProcessInfoProcess, PaneReadParams, PaneReadResult, PaneReleaseAgentParams,
-    PaneRenameParams, PaneReportAgentParams, PaneReportAgentSessionParams,
+    PaneRenameParams, PaneReportAgentParams, PaneReportAgentSessionParams, PaneReportBlockerParams,
     PaneReportMetadataParams, PaneResizeParams, PaneResizeReason, PaneResizeResult,
     PaneScrollParams, PaneSelectionReadParams, PaneSendInputParams, PaneSendKeysParams,
     PaneSendTextParams, PaneSplitParams, PaneSwapParams, PaneSwapReason, PaneSwapResult,
@@ -1909,6 +1909,45 @@ impl App {
         encode_success(id, ResponseResult::Ok {})
     }
 
+    pub(super) fn handle_pane_report_blocker(
+        &mut self,
+        id: String,
+        params: PaneReportBlockerParams,
+    ) -> String {
+        let Some((_ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let Some(source) = normalize_blocker_source(&params.source) else {
+            return invalid_blocker_source(id);
+        };
+        self.handle_internal_event(crate::events::AppEvent::ExternalBlockerReported {
+            pane_id,
+            source,
+            message: normalize_presentation_text(params.message),
+        });
+
+        encode_success(id, ResponseResult::Ok {})
+    }
+
+    pub(super) fn handle_pane_clear_blocker(
+        &mut self,
+        id: String,
+        params: PaneClearBlockerParams,
+    ) -> String {
+        let Some((_ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let Some(source) = normalize_blocker_source(&params.source) else {
+            return invalid_blocker_source(id);
+        };
+        self.handle_internal_event(crate::events::AppEvent::ExternalBlockerCleared {
+            pane_id,
+            source,
+        });
+
+        encode_success(id, ResponseResult::Ok {})
+    }
+
     pub(super) fn handle_pane_send_text(
         &mut self,
         id: String,
@@ -2310,6 +2349,19 @@ fn split_path_id(idx: usize, path: &[bool]) -> String {
         .collect::<Vec<_>>()
         .join("");
     format!("split_{idx}_{path}")
+}
+
+fn normalize_blocker_source(source: &str) -> Option<String> {
+    let source = source.trim();
+    (!source.is_empty()).then(|| source.to_string())
+}
+
+fn invalid_blocker_source(id: String) -> String {
+    encode_error(
+        id,
+        "invalid_blocker_source",
+        "blocker source must not be empty",
+    )
 }
 
 fn invalid_agent(id: String) -> String {
@@ -4638,6 +4690,190 @@ mod tests {
 
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(success.id, "req");
+    }
+
+    fn last_agent_status_event(
+        app: &App,
+    ) -> (
+        crate::api::schema::AgentStatus,
+        std::collections::HashMap<String, String>,
+    ) {
+        app.event_hub
+            .events_after(0)
+            .iter()
+            .rev()
+            .find_map(|(_, envelope)| match &envelope.data {
+                EventData::PaneAgentStatusChanged {
+                    agent_status,
+                    state_labels,
+                    ..
+                } => Some((*agent_status, state_labels.clone())),
+                _ => None,
+            })
+            .expect("agent status event")
+    }
+
+    #[test]
+    fn pane_report_blocker_and_clear_blocker_emit_agent_status_changes() {
+        let (mut app, pane_id) = app_with_test_workspace();
+        let root_pane = app.state.workspaces[0].tabs[0].root_pane;
+        app.handle_internal_event(crate::events::AppEvent::StateChanged {
+            pane_id: root_pane,
+            agent: Some(Agent::Claude),
+            state: AgentState::Idle,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        });
+
+        let response = app.handle_pane_report_blocker(
+            "report".into(),
+            PaneReportBlockerParams {
+                pane_id: pane_id.clone(),
+                source: " mattstack:gate ".into(),
+                message: Some(" Plan review ".into()),
+            },
+        );
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let (status, labels) = last_agent_status_event(&app);
+        assert_eq!(status, crate::api::schema::AgentStatus::Blocked);
+        assert_eq!(
+            labels.get("blocked").map(String::as_str),
+            Some("Plan review")
+        );
+
+        let response = app.handle_pane_clear_blocker(
+            "clear".into(),
+            PaneClearBlockerParams {
+                pane_id: pane_id.clone(),
+                source: "mattstack:gate".into(),
+            },
+        );
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let (status, labels) = last_agent_status_event(&app);
+        assert_eq!(status, crate::api::schema::AgentStatus::Idle);
+        assert!(labels.is_empty());
+
+        let events_before = app.event_hub.events_after(0).len();
+        let response = app.handle_pane_clear_blocker(
+            "clear-again".into(),
+            PaneClearBlockerParams {
+                pane_id,
+                source: "mattstack:gate".into(),
+            },
+        );
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(app.event_hub.events_after(0).len(), events_before);
+    }
+
+    fn report_idle_claude(app: &mut App) {
+        let root_pane = app.state.workspaces[0].tabs[0].root_pane;
+        app.handle_internal_event(crate::events::AppEvent::StateChanged {
+            pane_id: root_pane,
+            agent: Some(Agent::Claude),
+            state: AgentState::Idle,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        });
+    }
+
+    #[test]
+    fn pane_report_blocker_on_a_pane_with_no_agent_is_ignored() {
+        let (mut app, pane_id) = app_with_test_workspace();
+        let terminal_id = app.state.workspaces[0].tabs[0]
+            .terminal_id(app.state.workspaces[0].tabs[0].root_pane)
+            .unwrap()
+            .clone();
+
+        let response = app.handle_pane_report_blocker(
+            "report".into(),
+            PaneReportBlockerParams {
+                pane_id,
+                source: "mattstack:gate".into(),
+                message: Some("Plan review".into()),
+            },
+        );
+
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(app.state.terminals[&terminal_id]
+            .external_blockers
+            .is_empty());
+    }
+
+    #[test]
+    fn pane_report_blocker_treats_blank_message_as_none() {
+        let (mut app, pane_id) = app_with_test_workspace();
+        report_idle_claude(&mut app);
+        let terminal_id = app.state.workspaces[0].tabs[0]
+            .terminal_id(app.state.workspaces[0].tabs[0].root_pane)
+            .unwrap()
+            .clone();
+
+        let response = app.handle_pane_report_blocker(
+            "report".into(),
+            PaneReportBlockerParams {
+                pane_id,
+                source: "mattstack:gate".into(),
+                message: Some("   ".into()),
+            },
+        );
+
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            app.state.terminals[&terminal_id].external_blockers["mattstack:gate"],
+            None
+        );
+    }
+
+    #[test]
+    fn pane_blocker_methods_reject_blank_source() {
+        let (mut app, pane_id) = app_with_test_workspace();
+
+        let report = app.handle_pane_report_blocker(
+            "report".into(),
+            PaneReportBlockerParams {
+                pane_id: pane_id.clone(),
+                source: "  ".into(),
+                message: None,
+            },
+        );
+        let clear = app.handle_pane_clear_blocker(
+            "clear".into(),
+            PaneClearBlockerParams {
+                pane_id,
+                source: String::new(),
+            },
+        );
+
+        assert_eq!(metadata_error_code(&report), "invalid_blocker_source");
+        assert_eq!(metadata_error_code(&clear), "invalid_blocker_source");
+    }
+
+    #[test]
+    fn pane_blocker_methods_reject_unknown_pane() {
+        let (mut app, _pane_id) = app_with_test_workspace();
+
+        let report = app.handle_pane_report_blocker(
+            "report".into(),
+            PaneReportBlockerParams {
+                pane_id: "w9:p9".into(),
+                source: "mattstack:gate".into(),
+                message: None,
+            },
+        );
+        let clear = app.handle_pane_clear_blocker(
+            "clear".into(),
+            PaneClearBlockerParams {
+                pane_id: "w9:p9".into(),
+                source: "mattstack:gate".into(),
+            },
+        );
+
+        assert_eq!(metadata_error_code(&report), "pane_not_found");
+        assert_eq!(metadata_error_code(&clear), "pane_not_found");
     }
 
     #[test]

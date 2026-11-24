@@ -298,6 +298,18 @@ herdr pane release-agent <pane_id> \
 
 `report-agent-session` updates native session identity without reporting lifecycle state. `release-agent` ends that source's lifecycle authority when its agent process exits.
 
+Show a pane as blocked while a tool other than the agent's integration waits on a person:
+
+```bash
+herdr pane report-blocker <pane_id> \
+  --source ID \
+  [--message TEXT]
+
+herdr pane clear-blocker <pane_id> --source ID
+```
+
+While any source holds a blocker, an idle or done pane reads as `blocked`. A working pane stays working and reads as blocked again once it goes idle. `--message` becomes the pane's `blocked` state label unless `report-metadata` already set one. Each source holds one blocker; a second report from the same source replaces it. `clear-blocker` succeeds even when the source holds no blocker. A report on a pane with no agent succeeds and changes nothing. Blockers end when their source clears them, a non-native integration releases the agent, the agent's process exits, or the pane respawns or closes. While a pane is blocked, `agent prompt` refuses it with `agent_blocked`.
+
 Arguments after `--` are the command Herdr runs to resume this session after a server restart. The first argument must be a plain command name on `PATH`, and no argument may contain an apostrophe.
 
 `pane get`, `pane list`, `agent get`, and `agent list` include a read-only `agent_session` object when an official integration has reported a native session reference. If no native session reference is stored, the field is omitted.

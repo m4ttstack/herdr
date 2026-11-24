@@ -686,6 +686,8 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::PaneReportMetadata(_) => "pane.report_metadata",
         Method::PaneClearAgentAuthority(_) => "pane.clear_agent_authority",
         Method::PaneReleaseAgent(_) => "pane.release_agent",
+        Method::PaneReportBlocker(_) => "pane.report_blocker",
+        Method::PaneClearBlocker(_) => "pane.clear_blocker",
         Method::PaneClose(_) => "pane.close",
         Method::PopupClose(_) => "popup.close",
         Method::EventsSubscribe(_) => "events.subscribe",
