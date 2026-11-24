@@ -2,6 +2,8 @@
 # Moves the fork commits on the current mattstack branch onto a new upstream tag,
 # as branch mattstack/<version>. The current branch is left as it was.
 # Exit 0: rebased cleanly. Exit 3: a fork commit conflicts; its subject is on stderr.
+# Exit 4: the rebase failed for another reason; git's output is on stderr.
+# Exit 2: bad input. Every failure leaves no rebase state and the start branch checked out.
 set -euo pipefail
 
 TAG="${1:-}"
@@ -23,12 +25,34 @@ fi
 
 START="$(git symbolic-ref --quiet --short HEAD || git rev-parse HEAD)"
 
-abort_with() { # abort_with <subject>
-  git rebase --abort 2>/dev/null || true
-  git switch -q "$START"
-  git branch -q -D "$NEW_BRANCH"
+LOG="$(mktemp)"
+trap 'rm -f "$LOG"' EXIT
+
+in_rebase() {
+  [ -d "$(git rev-parse --git-path rebase-merge)" ] || [ -d "$(git rev-parse --git-path rebase-apply)" ]
+}
+
+# Undoes the rebase even when --abort fails, and returns to the start branch.
+clean_up() {
+  if in_rebase; then
+    git rebase --abort >/dev/null 2>&1 || git rebase --quit >/dev/null 2>&1 \
+      || rm -rf "$(git rev-parse --git-path rebase-merge)" "$(git rev-parse --git-path rebase-apply)"
+  fi
+  git reset -q --hard
+  git switch -q -f "$START"
+  git branch -q -D "$NEW_BRANCH" 2>/dev/null || true
+}
+
+conflict() { # conflict <subject>
+  clean_up
   echo "ms/rebase-onto.sh: fork commit \"$1\" conflicts with $TAG" >&2
   exit 3
+}
+
+failed() { # failed <detail>
+  clean_up
+  echo "ms/rebase-onto.sh: rebase failed onto $TAG: $1" >&2
+  exit 4
 }
 
 # The fork replaces upstream's README files, so a conflict in one of them always
@@ -50,14 +74,26 @@ resolve_readmes() {
   done <<<"$conflicted"
 }
 
+# rebase_through <git rebase args>: runs a rebase to the end, resolving README
+# conflicts; any other conflict exits 3, any other failure exits 4.
+rebase_through() {
+  local subject
+  if ! git rebase "$@" >"$LOG" 2>&1; then
+    in_rebase || failed "$(cat "$LOG")"
+  fi
+  while in_rebase; do
+    subject="$(git log -1 --format=%s REBASE_HEAD 2>/dev/null || echo "unknown commit")"
+    [ -n "$(git diff --name-only --diff-filter=U)" ] || failed "it stopped at \"$subject\" without a conflict: $(cat "$LOG")"
+    resolve_readmes || conflict "$subject"
+    if ! git rebase --continue >"$LOG" 2>&1; then
+      in_rebase || failed "$(cat "$LOG")"
+    fi
+  done
+}
+
 git switch -q -c "$NEW_BRANCH"
 export GIT_EDITOR=true
-git rebase -q --onto "$TAG" "$OLD_BASE" "$NEW_BRANCH" >/dev/null 2>&1 || true
-while [ -d "$(git rev-parse --git-path rebase-merge)" ] || [ -d "$(git rev-parse --git-path rebase-apply)" ]; do
-  SUBJECT="$(git log -1 --format=%s REBASE_HEAD 2>/dev/null || echo "unknown commit")"
-  resolve_readmes || abort_with "$SUBJECT"
-  git rebase --continue >/dev/null 2>&1 || true
-done
+rebase_through -q --onto "$TAG" "$OLD_BASE" "$NEW_BRANCH"
 
 # The README names the upstream version the fork is built on; fold the new one
 # into the commit that last changed the README.
@@ -66,7 +102,7 @@ if [ -n "$README_COMMIT" ] && grep -qF "$OLD_VERSION" README.md; then
   OLD_PATTERN="$(printf '%s' "$OLD_VERSION" | sed 's/\./\\./g')"
   sed -i.bak "s/$OLD_PATTERN/$VERSION/g" README.md && rm -f README.md.bak
   git commit -q --fixup="$README_COMMIT" -- README.md
-  GIT_SEQUENCE_EDITOR=true git rebase -q -i --autosquash "$TAG" >/dev/null 2>&1 || abort_with "README base version"
+  GIT_SEQUENCE_EDITOR=true rebase_through -q -i --autosquash "$TAG"
 fi
 
 echo "ms/rebase-onto.sh: $NEW_BRANCH = $TAG + $(git rev-list --count "$TAG..$NEW_BRANCH") fork commits"

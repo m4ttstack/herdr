@@ -65,5 +65,43 @@ g switch -q mattstack/1.0.0
 (cd "$REPO" && "$SCRIPT" v1.0.1 >/dev/null 2>&1); CODE=$?
 if [ "$CODE" -ne 0 ] && [ "$CODE" -ne 3 ]; then ok "refuses when mattstack/1.0.1 already exists"; else bad "refuses when mattstack/1.0.1 already exists (got $CODE)"; fi
 
+clean_on() { # clean_on <label> <branch left behind> <branch to be on>
+  if ! g rev-parse -q --verify "refs/heads/$2" >/dev/null; then ok "$1: no $2 left behind"; else bad "$1: no $2 left behind"; g branch -q -D "$2" 2>/dev/null; fi
+  if [ ! -d "$REPO/.git/rebase-merge" ] && [ ! -d "$REPO/.git/rebase-apply" ] && [ -z "$(g status --porcelain)" ]; then
+    ok "$1: no rebase state, a clean tree"; else bad "$1: no rebase state, a clean tree"; fi
+  if [ "$(g symbolic-ref --short HEAD 2>/dev/null)" = "$3" ]; then ok "$1: back on $3"; else bad "$1: back on $3"; fi
+}
+
+# A rebase git refuses outright is not a conflict.
+g switch -q main; printf 'version = "1.0.4"\n' > "$REPO/Cargo.toml"; g commit -qam "release: v1.0.4"; g tag v1.0.4
+g switch -q mattstack/1.0.0
+printf '#!/bin/sh\nexit 1\n' > "$REPO/.git/hooks/pre-rebase"; chmod +x "$REPO/.git/hooks/pre-rebase"
+ERR="$(cd "$REPO" && "$SCRIPT" v1.0.4 2>&1 >/dev/null)"; CODE=$?
+rm -f "$REPO/.git/hooks/pre-rebase"
+if [ "$CODE" -ne 0 ] && [ "$CODE" -ne 3 ]; then ok "a refused rebase exits non-zero, not 3"; else bad "a refused rebase exits non-zero, not 3 (got $CODE)"; fi
+case "$ERR" in *"rebase failed"*) ok "stderr says the rebase failed" ;; *) bad "stderr says the rebase failed (got: $ERR)" ;; esac
+clean_on "a refused rebase" mattstack/1.0.4 mattstack/1.0.0
+
+# git stand-ins: one stops the rebase without a conflict, one fails --abort.
+REAL_GIT="$(command -v git)"
+STUBS="$(mktemp -d)"; trap 'rm -rf "$REPO" "$STUBS"' EXIT
+cat > "$STUBS/git" <<STUB
+#!/bin/bash
+if [ "\$1 \$2 \$3" = "rebase -q --onto" ] && [ -n "\${STUB_STOP:-}" ]; then shift 2; exec "$REAL_GIT" rebase -q --exec false "\$@"; fi
+if [ "\$1 \$2" = "rebase --abort" ] && [ -n "\${STUB_FAIL_ABORT:-}" ]; then echo "stub: abort failed" >&2; exit 1; fi
+exec "$REAL_GIT" "\$@"
+STUB
+chmod +x "$STUBS/git"
+
+ERR="$(cd "$REPO" && STUB_STOP=1 PATH="$STUBS:$PATH" "$SCRIPT" v1.0.4 2>&1 >/dev/null)"; CODE=$?
+if [ "$CODE" -ne 0 ] && [ "$CODE" -ne 3 ]; then ok "a rebase that stops without a conflict exits non-zero, not 3"; else bad "a rebase that stops without a conflict exits non-zero, not 3 (got $CODE)"; fi
+case "$ERR" in *"rebase failed"*) ok "stderr says the rebase failed, not a conflict" ;; *) bad "stderr says the rebase failed, not a conflict (got: $ERR)" ;; esac
+clean_on "a rebase that stops" mattstack/1.0.4 mattstack/1.0.0
+
+g switch -q mattstack/1.0.0
+ERR="$(cd "$REPO" && STUB_FAIL_ABORT=1 PATH="$STUBS:$PATH" "$SCRIPT" v1.0.2 2>&1 >/dev/null)"; CODE=$?
+if [ "$CODE" -eq 3 ]; then ok "a conflict whose --abort fails still exits 3"; else bad "a conflict whose --abort fails still exits 3 (got $CODE: $ERR)"; fi
+clean_on "a failed --abort" mattstack/1.0.2 mattstack/1.0.0
+
 [ "$FAILS" -eq 0 ] || { echo "rebase-onto.sh: $FAILS check(s) failed" >&2; exit 1; }
 echo "PASS: rebase-onto"
