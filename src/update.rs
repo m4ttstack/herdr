@@ -432,8 +432,8 @@ fn handle_manifest_announcement(version: &str, value: Option<&serde_json::Value>
 }
 
 fn release_info_from_manifest(manifest: &UpdateManifest) -> Result<Option<ReleaseInfo>, String> {
-    let installed_fork_revision =
-        crate::build_info::is_fork().then(|| crate::build_info::fork_revision().unwrap_or(0));
+    let installed_fork_revision = (crate::build_info::fork() == crate::build_info::Fork::Release)
+        .then(|| crate::build_info::fork_revision().unwrap_or(0));
     release_info_from_manifest_for(
         manifest,
         &Version::current(),
