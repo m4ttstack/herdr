@@ -171,10 +171,12 @@ if [ -n "$STAGED" ]; then
   PROBE=$(mktemp -d /tmp/herdr-signer-probe.XXXXXX)
   cp /usr/bin/true "$PROBE/probe"
   if ! sudo "$HOOK_DIR/rcodesign" sign --config-file /dev/null --p12-file "$KEY_DIR/developer-id.p12.new" \
-      --p12-password-file "$KEY_DIR/p12-password.new" --timestamp-url none "$PROBE/probe" >/dev/null 2>&1; then
+      --p12-password-file "$KEY_DIR/p12-password.new" --timestamp-url none "$PROBE/probe" >"$PROBE/log" 2>&1; then
+    tail -1 "$PROBE/log" >&2
     sudo rm -rf "$PROBE"
     sudo rm -f "$KEY_DIR/developer-id.p12.new" "$KEY_DIR/p12-password.new"
     echo "rcodesign cannot sign with that .p12 and password; the runner's key is unchanged." >&2
+    echo "With the right password, convert the .p12 and install again: openssl pkcs12 -in developer-id.p12 -nodes | openssl pkcs12 -export -legacy -out developer-id-legacy.p12" >&2
     exit 1
   fi
   sudo rm -rf "$PROBE"
