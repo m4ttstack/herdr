@@ -127,6 +127,7 @@ ruby -ryaml -e '
     check = publish["steps"].find { |s| s["run"].to_s.include?("shasum -a 256 -c") } || {}
     fails << "the publish job does not check the binaries against the hashes the build reported" unless
       check["env"].to_s.include?("needs.build.outputs.arm64_sha256") && check["env"].to_s.include?("needs.build.outputs.x86_64_sha256")
+    fails << "the hash check lets an empty or malformed hash through" unless check["run"].to_s.include?("^[0-9a-f]{64}$")
     fails << "the hash check comes after the manifests" unless names.index(check["name"].to_s).to_i.between?(1, names.index("Write manifests").to_i - 1)
     order = build["steps"].map { |s| s["name"].to_s }
     fails << "the build hashes before it verifies" unless order.index("Report the hashes").to_i > order.index { |n| n.start_with?("Verify") }.to_i
@@ -165,6 +166,12 @@ ruby -ryaml -e '
   end
   fails << "the candidate job can still write issues" if jobs.dig("candidate", "permissions", "issues")
   candidate = jobs.fetch("candidate")
+  %w[candidate push].each do |name|
+    step = (jobs.dig(name, "steps") || []).find { |s| s["run"].to_s.include?("ms/rebase-onto.sh") } || {}
+    fails << "the #{name} job does not rebase the commit find picked" unless
+      step.dig("env", "SOURCE_SHA") == "${{ needs.find.outputs.source_sha }}" && step["run"].to_s.include?(%q(git switch -q -C "$SOURCE" "$SOURCE_SHA"))
+  end
+  fails << "find does not pick the source commit" unless jobs.dig("find", "outputs", "source_sha")
   fails << "the candidate job is granted a token scope" unless candidate["permissions"] == {}
   fails << "the candidate job has a post step that gets the job token" if candidate["steps"].any? { |s| s["uses"].to_s.start_with?("actions/checkout") }
   zig = candidate["steps"].find { |s| s["uses"].to_s.start_with?("mlugg/setup-zig") }

@@ -54,7 +54,8 @@ jobs:
           base="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
           [ "$BRANCH" = "mattstack/$base" ] || { echo "::error::$BRANCH builds herdr $base; expected branch mattstack/$base"; exit 1; }
           tags="$(gh release list -R "$REPO" --limit 1000 --json tagName --jq '.[].tagName')"
-          last="$(printf '%s\n' "$tags" | sed -n "s/^v${base//./\\.}-ms\.\([0-9][0-9]*\)$/\1/p" | sort -n | tail -1)"
+          pattern="$(printf '%s' "$base" | sed 's/\./\\./g')"
+          last="$(printf '%s\n' "$tags" | sed -n "s/^v$pattern-ms\.\([0-9][0-9]*\)$/\1/p" | sort -n | tail -1)"
           revision=$(( ${last:-0} + 1 ))
           newest_base="$(printf '%s\n' "$tags" | sed -n 's/^v\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)-ms\.[0-9][0-9]*$/\1/p' | sort -V | tail -1)"
           if [ -n "$newest_base" ] && [ "$(printf '%s\n%s\n' "$base" "$newest_base" | sort -V | tail -1)" != "$base" ]; then
@@ -176,6 +177,9 @@ jobs:
           X86_64_SHA256: ${{ needs.build.outputs.x86_64_sha256 }}
         run: |
           set -euo pipefail
+          for hash in "$ARM64_SHA256" "$X86_64_SHA256"; do
+            [[ "$hash" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::the build reported no hash for a binary"; exit 1; }
+          done
           printf '%s  dist/herdr-macos-aarch64\n%s  dist/herdr-macos-x86_64\n' "$ARM64_SHA256" "$X86_64_SHA256" | shasum -a 256 -c -
 
       - name: Write manifests
