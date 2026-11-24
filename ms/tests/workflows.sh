@@ -48,20 +48,27 @@ ruby -ryaml -e '
   end
 ' "$ROOT/.github/workflows/ms-release.yml" "$ROOT/ms/runner/install.sh" || exit 1
 
-# A launchd daemon runs outside any user session, where macOS refuses keychain
-# signing, so the release signs with a pinned rcodesign and the .p12 file.
+# Build code in a release job runs as herdr-signer, so the signing key is
+# root-only: the job signs through the root-owned helper and no step reads the key.
 ruby -ryaml -e '
   steps = YAML.load_file(ARGV[0]).dig("jobs", "release", "steps")
-  sign = steps.find { |s| s["name"] == "Sign" }["run"]
+  sign = (steps.find { |s| s["name"] == "Sign and notarize" } || {})["run"].to_s
+  plist = File.read(ARGV[1])[/<plist.*<\/plist>/m].to_s
   fails = []
-  fails << "the Sign step does not check rcodesign against a pinned sha256" unless sign =~ /apple-codesign-[0-9.]+-macos-universal\.tar\.gz/ && sign =~ /[0-9a-f]{64}  .*shasum -a 256 -c|shasum -a 256 -c/ && sign =~ /[0-9a-f]{64}/
-  fails << "the Sign step does not sign with hardened runtime" unless sign =~ /--code-signature-flags runtime/
-  fails << "the Sign step does not read the .p12 file" unless sign.include?("$HERDR_SIGNING_P12") && sign.include?("$HERDR_SIGNING_P12_PASSWORD_FILE")
+  fails << "no Sign and notarize step calls sudo -n /usr/local/herdr-signer/sign.sh" unless sign =~ %r{sudo -n /usr/local/herdr-signer/sign\.sh}
+  %w[herdr-macos-aarch64 herdr-macos-x86_64].each do |asset|
+    fails << "the Sign and notarize step does not hand the helper #{asset}" unless sign =~ %r{"\$PWD/dist/#{asset}"}
+  end
+  key = /developer-id\.p12|p12-password|\.herdr-signing|HERDR_SIGNING|herdr-signer\/keys|notary-api-key|rcodesign/
+  steps.each do |s|
+    fails << "#{s["name"] || s["uses"]} references the signing key or rcodesign" if s.to_yaml =~ key
+  end
+  fails << "the runner launchd job hands jobs a signing key path" if plist =~ key
   fails << "a release step still uses the keychain" if steps.any? { |s| s["run"].to_s =~ /security |codesign --force|KEYCHAIN/ }
   if fails.empty?
-    puts "PASS: the Sign step signs with a pinned rcodesign and the .p12 file"
+    puts "PASS: release jobs sign through the root-owned helper and never read the key"
   else
     fails.each { |f| warn "FAIL #{f}" }
     exit 1
   end
-' "$ROOT/.github/workflows/ms-release.yml" || exit 1
+' "$ROOT/.github/workflows/ms-release.yml" "$ROOT/ms/runner/install.sh" || exit 1

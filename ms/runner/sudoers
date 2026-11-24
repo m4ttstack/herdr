@@ -1,0 +1,4 @@
+# /etc/sudoers.d/herdr-signer, installed by ms/runner/install.sh. Release jobs
+# run as herdr-signer and sign through this one root-owned helper; the signing
+# key is readable only by root.
+herdr-signer ALL=(root) NOPASSWD: /usr/local/herdr-signer/sign.sh
