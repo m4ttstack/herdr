@@ -27,6 +27,7 @@ jobs:
     outputs:
       action: ${{ steps.find.outputs.action }}
       source: ${{ steps.find.outputs.source }}
+      source_sha: ${{ steps.find.outputs.source_sha }}
       current: ${{ steps.find.outputs.current }}
       newest: ${{ steps.find.outputs.newest }}
     steps:
@@ -37,6 +38,7 @@ jobs:
           origin="https://github.com/$REPO.git"
           source="$(git ls-remote --heads "$origin" 'mattstack/*' | sed -n 's|.*refs/heads/\(mattstack/[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)$|\1|p' | sort -V | tail -1)"
           [ -n "$source" ] || { echo "::error::no mattstack/<version> branch"; exit 1; }
+          source_sha="$(git ls-remote --heads "$origin" "refs/heads/$source" | cut -f1)"
           current="${source#mattstack/}"
           newest="$(git ls-remote --tags --refs "$UPSTREAM" 'v*' | sed -n 's|.*refs/tags/v\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)$|\1|p' | sort -V | tail -1)"
           echo "fork base $current (from $source); upstream newest $newest"
@@ -51,6 +53,7 @@ jobs:
           {
             echo "action=rebase"
             echo "source=$source"
+            echo "source_sha=$source_sha"
             echo "current=$current"
             echo "newest=$newest"
           } >> "$GITHUB_OUTPUT"
@@ -79,6 +82,7 @@ jobs:
         id: rebase
         env:
           SOURCE: ${{ needs.find.outputs.source }}
+          SOURCE_SHA: ${{ needs.find.outputs.source_sha }}
           CURRENT: ${{ needs.find.outputs.current }}
           NEWEST: ${{ needs.find.outputs.newest }}
         run: |
@@ -86,7 +90,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
           git fetch -q --no-tags "$UPSTREAM" "refs/tags/v$CURRENT:refs/tags/v$CURRENT" "refs/tags/v$NEWEST:refs/tags/v$NEWEST"
-          git switch -q "$SOURCE"
+          git switch -q -C "$SOURCE" "$SOURCE_SHA"
           code=0
           ms/rebase-onto.sh "v$NEWEST" 2> rebase.err || code=$?
           cat rebase.err >&2
@@ -146,6 +150,7 @@ jobs:
       - name: Rebase onto the new release
         env:
           SOURCE: ${{ needs.find.outputs.source }}
+          SOURCE_SHA: ${{ needs.find.outputs.source_sha }}
           CURRENT: ${{ needs.find.outputs.current }}
           NEWEST: ${{ needs.find.outputs.newest }}
           TESTED_TREE: ${{ needs.candidate.outputs.tree }}
@@ -154,7 +159,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
           git fetch -q --no-tags "$UPSTREAM" "refs/tags/v$CURRENT:refs/tags/v$CURRENT" "refs/tags/v$NEWEST:refs/tags/v$NEWEST"
-          git switch -q "$SOURCE"
+          git switch -q -C "$SOURCE" "$SOURCE_SHA"
           ms/rebase-onto.sh "v$NEWEST"
           tree="$(git rev-parse "mattstack/$NEWEST^{tree}")"
           [ "$tree" = "$TESTED_TREE" ] || { echo "::error::this rebase gave tree $tree, but the candidate job tested $TESTED_TREE"; exit 1; }
