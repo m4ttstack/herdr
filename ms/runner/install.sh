@@ -171,7 +171,6 @@ sudo -u "$CI_USER" sudo -n -l /usr/local/herdr-signer/sign.sh >/dev/null || {
   echo "sudo does not let $CI_USER run $HOOK_DIR/sign.sh; check that /etc/sudoers includes /private/etc/sudoers.d." >&2; exit 1; }
 if sudo test -f "$OLD_KEYCHAIN"; then
   sudo -u "$CI_USER" -H security delete-keychain "$OLD_KEYCHAIN"
-  sudo rm -f "$SIGNING_DIR/keychain-password"
 fi
 
 if ! sudo test -f "$DIR/.runner"; then

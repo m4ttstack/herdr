@@ -31,5 +31,14 @@ refuses "notary flags in part" "--notary-issuer" --notary-key-id ABC --notary-ke
 refuses "a flag with no value" "--p12" --p12
 refuses "a flag followed by another flag" "--notary-key-id" --notary-key-id --notary-issuer X
 
+# set -u turns a variable nobody assigns into an abort halfway through.
+UNSET="$(ruby -e '
+  src = File.read(ARGV[0])
+  used = src.scan(/\$\{?([A-Z][A-Z0-9_]*)/).flatten.uniq
+  set = src.scan(/(?:^|[\s;(])([A-Z][A-Z0-9_]*)=/).flatten + src.scan(/\bread\b.*\s([A-Z][A-Z0-9_]*)$/).flatten + %w[PWD HOME USER]
+  puts (used - set).join(" ")
+' "$ROOT/ms/runner/install.sh")"
+if [ -z "$UNSET" ]; then echo "ok   every variable the installer reads is assigned"; else echo "FAIL every variable the installer reads is assigned (not assigned: $UNSET)" >&2; FAILS=1; fi
+
 [ "$FAILS" -eq 0 ] || exit 1
 echo "PASS: runner install refuses bad input before changing anything"
