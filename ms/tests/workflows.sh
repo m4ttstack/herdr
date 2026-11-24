@@ -171,7 +171,7 @@ ruby -ryaml -e '
     fails << "the #{name} job does not rebase the commit find picked" unless
       step.dig("env", "SOURCE_SHA") == "${{ needs.find.outputs.source_sha }}" && step["run"].to_s.include?(%q(git switch -q -C "$SOURCE" "$SOURCE_SHA"))
   end
-  fails << "find does not pick the source commit" unless jobs.dig("find", "outputs", "source_sha")
+  fails << "find does not pick the source commit" unless jobs.dig("find", "outputs", "source_sha") && jobs.dig("find", "steps").any? { |s| s["run"].to_s.include?(%q(echo "source_sha=$source_sha")) }
   fails << "the candidate job is granted a token scope" unless candidate["permissions"] == {}
   fails << "the candidate job has a post step that gets the job token" if candidate["steps"].any? { |s| s["uses"].to_s.start_with?("actions/checkout") }
   zig = candidate["steps"].find { |s| s["uses"].to_s.start_with?("mlugg/setup-zig") }
