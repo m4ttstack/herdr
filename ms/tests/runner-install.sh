@@ -40,27 +40,86 @@ UNSET="$(ruby -e '
 ' "$ROOT/ms/runner/install.sh")"
 if [ -z "$UNSET" ]; then echo "ok   every variable the installer reads is assigned"; else echo "FAIL every variable the installer reads is assigned (not assigned: $UNSET)" >&2; FAILS=1; fi
 
-# Migration: build code could have swapped the old key files for links, so they
-# are read as that user and never moved into the root-only directory.
-BLOCK="$(sed -n '/^elif sudo test -f "\$OLD_SIGNING_DIR/,/^fi$/p' "$ROOT/ms/runner/install.sh" | sed -e '1s/^elif/if/')"
-OLD="$TMP/old"; KEYS="$TMP/keys"; mkdir -p "$OLD" "$KEYS"
-printf 'secret' > "$TMP/root-file"; chmod 400 "$TMP/root-file"
-printf 'p12' > "$OLD/developer-id.p12"; ln -s "$TMP/root-file" "$OLD/p12-password"
-migrate() { # runs the block with sudo as a plain runner; "sudo -u" refuses $TMP/root-file, as that user's reads would be
-  (set -euo pipefail
-   OLD_SIGNING_DIR="$OLD" KEY_DIR="$KEYS" CI_USER=herdr-signer
+# The installer runs as an admin with sudo, and build code owns everything under
+# the runner user's home, so nothing it looks up may resolve there. Runs the
+# whole script with every command that changes the Mac stubbed out, and records
+# the PATH in effect at each command, inside the stubs too.
+cat > "$TMP/harness.sh" <<'HARNESS'
+sudo() { case "$*" in "-u herdr-signer test -x"*) return 1 ;; esac; :; }
+zig() { echo 0.16.0; }
+for tool in curl shasum tar gh jq launchctl security visudo sleep; do eval "$tool() { :; }"; done
+id() { echo 501; }
+seen_path() { [ "$PATH" = "${SEEN_PATH:-}" ] || { SEEN_PATH="$PATH"; printf '%s\n' "$PATH" >> "$PATH_LOG"; }; }
+set -T
+trap seen_path DEBUG
+HARNESS
+PATH_LOG="$TMP/paths"; : > "$PATH_LOG"
+OUT="$(cd "$ROOT" && unset -f sudo && PATH_LOG="$PATH_LOG" BASH_ENV="$TMP/harness.sh" PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+  bash ms/runner/install.sh --registration-token T --notary-key-id K --notary-issuer I --notary-key "$P8" </dev/null 2>&1)"; CODE=$?
+if [ "$CODE" -eq 0 ]; then case "$OUT" in *"Installed herdr-signer-"*) echo "ok   the stubbed install runs to the end" ;; *) echo "FAIL the stubbed install runs to the end (got: $OUT)" >&2; FAILS=1 ;; esac
+else echo "FAIL the stubbed install runs to the end (exit $CODE: $OUT)" >&2; FAILS=1; fi
+WRITABLE="$(tr ':' '\n' < "$PATH_LOG" | grep -E -v '^(/usr/bin|/bin|/usr/sbin|/sbin|/opt/homebrew/bin|/usr/local/bin)$' | sort -u | tr '\n' ' ')"
+if [ -s "$PATH_LOG" ] && [ -z "$WRITABLE" ]; then echo "ok   the installer looks commands up only in system and Homebrew directories"
+else echo "FAIL the installer looks commands up only in system and Homebrew directories (also: $WRITABLE)" >&2; FAILS=1; fi
+# A one-command PATH in front of a builtin (command -v) never shows in the log.
+USES="$(grep -n 'TOOL_PATH' "$ROOT/ms/runner/install.sh" | grep -v -E '^[0-9]+:(TOOL_PATH=|[[:space:]]*#|[[:space:]]*<key>PATH</key>)')"
+if [ -z "$USES" ]; then echo "ok   only the launchd job gets the runner user's PATH"; else echo "FAIL only the launchd job gets the runner user's PATH ($USES)" >&2; FAILS=1; fi
+DROPIN_LINE="$(grep -n 'sudoers.d/herdr-signer$' "$ROOT/ms/runner/install.sh" | head -1 | cut -d: -f1)"
+AS_USER_LINE="$(grep -n 'sudo -u "\$CI_USER"' "$ROOT/ms/runner/install.sh" | head -1 | cut -d: -f1)"
+if [ "${DROPIN_LINE:-9999}" -lt "$AS_USER_LINE" ]; then echo "ok   the sudoers drop-in is in place before anything runs as the runner user"
+else echo "FAIL the sudoers drop-in is in place before anything runs as the runner user" >&2; FAILS=1; fi
+
+# The key files: staged, proved with a throwaway signing, then put in place, and
+# only then is an older install's copy removed. The old files are read as the
+# runner user, since build code could have swapped one for a link.
+BLOCK="$(sed -n '/^sudo install -d -o root -g wheel -m 700 "\$KEY_DIR"$/,/^sudo -u "\$CI_USER" sudo -n -l/p' "$ROOT/ms/runner/install.sh" | sed '$d')"
+mkdir -p "$TMP/hook"
+cat > "$TMP/hook/rcodesign" <<'STUB'
+#!/bin/bash
+cmd="$1"; shift
+p12=""; pw=""; out=""
+while [ $# -gt 0 ]; do case "$1" in --p12-file) p12="$2"; shift ;; --p12-password-file) pw="$2"; shift ;; -o) out="$2"; shift ;; esac; shift; done
+case "$cmd" in
+  sign) [ "$(cat "$p12"):$(cat "$pw")" = "p12:pw" ] ;;
+  encode-app-store-connect-api-key) echo '{}' > "$out" ;;
+esac
+STUB
+chmod 755 "$TMP/hook/rcodesign"
+OLD="$TMP/old"; KEYS="$TMP/keys"
+keys() { # keys <stdin> <P12>: runs the block, sudo as a plain runner
+  printf '%s' "$1" | (set -euo pipefail
+   P12="$2" OLD_SIGNING_DIR="$OLD" KEY_DIR="$KEYS" HOOK_DIR="$TMP/hook" CI_USER=herdr-signer
+   NOTARY_KEY="${NOTARY-$P8}" NOTARY_ISSUER=I NOTARY_KEY_ID=K
+   chown() { :; }
    sudo() {
-     if [ "$1" = -u ]; then shift 2; case "$(readlink "${!#}" 2>/dev/null)" in "$TMP/root-file") return 1 ;; esac; fi
+     if [ "$1" = -u ]; then shift 2; [ ! -L "${!#}" ] || return 1; fi
+     if [ "$1" = install ]; then shift; set -- "${@/#root/$(command id -un)}"; set -- "${@/#wheel/$(command id -gn)}"; command install "$@"; return; fi
      "$@"
    }
-   eval "$BLOCK") >/dev/null 2>&1
+   eval "$BLOCK") >"$TMP/keys.out" 2>&1
 }
-migrate
-if [ -z "$(ls "$KEYS" | grep -v '\.new$')" ] && [ -e "$OLD/developer-id.p12" ]; then echo "ok   a linked old key file is not migrated"; else echo "FAIL a linked old key file is not migrated (key dir: $(ls "$KEYS" | tr '\n' ' '))" >&2; FAILS=1; fi
-rm -f "$OLD/p12-password" "$KEYS"/*; printf 'pw' > "$OLD/p12-password"
-migrate
-if [ "$(cat "$KEYS/developer-id.p12" "$KEYS/p12-password" 2>/dev/null)" = p12pw ] && [ "$(ls "$KEYS" | wc -l | tr -d ' ')" = 2 ]; then echo "ok   the old key files are migrated"; else echo "FAIL the old key files are migrated (key dir: $(ls "$KEYS" | tr '\n' ' '))" >&2; FAILS=1; fi
-if [ "$(stat -f %Lp "$KEYS/developer-id.p12" 2>/dev/null)" = 600 ]; then echo "ok   a migrated key file is mode 600"; else echo "FAIL a migrated key file is mode 600" >&2; FAILS=1; fi
+reset_keys() { rm -rf "$OLD" "$KEYS"; mkdir -p "$OLD"; printf p12 > "$OLD/developer-id.p12"; printf pw > "$OLD/p12-password"; }
+key_is() { [ "$(cat "$KEYS/developer-id.p12" 2>/dev/null):$(cat "$KEYS/p12-password" 2>/dev/null)" = "$1" ]; }
+check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1 ($(cat "$TMP/keys.out"); keys: $(ls -l "$KEYS" 2>/dev/null))" >&2; FAILS=1; fi; }
+
+reset_keys; keys "" ""; CODE=$?
+check "an older install's key is migrated" '[ $CODE -eq 0 ] && key_is p12:pw && [ ! -e "$OLD" ]'
+check "the key directory is mode 700" '[ "$(stat -f %Lp "$KEYS")" = 700 ]'
+check "every key file is mode 600" '[ "$(stat -f %Lp "$KEYS"/* | sort -u)" = 600 ] && [ "$(ls "$KEYS" | wc -l | tr -d " ")" = 3 ]'
+reset_keys; rm "$OLD/p12-password"; ln -s "$P8" "$OLD/p12-password"; keys "" ""; CODE=$?
+check "a linked old key file stops the install and stays" '[ $CODE -ne 0 ] && [ ! -e "$KEYS/developer-id.p12" ] && [ -e "$OLD/developer-id.p12" ]'
+reset_keys; printf bad > "$OLD/p12-password"; keys "" ""; CODE=$?
+check "an old key that cannot sign is not migrated" '[ $CODE -ne 0 ] && [ ! -e "$KEYS/developer-id.p12" ] && [ -e "$OLD/developer-id.p12" ]'
+reset_keys; mkdir -p "$KEYS"; printf half > "$KEYS/developer-id.p12"; keys "" ""; CODE=$?
+check "a .p12 with no password does not count as installed" '[ $CODE -eq 0 ] && key_is p12:pw'
+reset_keys; mkdir -p "$KEYS"; printf kept > "$KEYS/developer-id.p12"; printf keptpw > "$KEYS/p12-password"; keys "" ""; CODE=$?
+check "a rerun keeps the installed key" '[ $CODE -eq 0 ] && key_is kept:keptpw && [ ! -e "$OLD" ]'
+printf p12 > "$TMP/new.p12"
+reset_keys; mkdir -p "$KEYS"; printf kept > "$KEYS/developer-id.p12"; printf keptpw > "$KEYS/p12-password"
+keys $'wrong\n' "$TMP/new.p12"; CODE=$?
+check "a mistyped .p12 password changes nothing" '[ $CODE -ne 0 ] && key_is kept:keptpw && [ -e "$OLD" ] && [ -z "$(ls "$KEYS" | grep new)" ]'
+keys $'pw\n' "$TMP/new.p12"; CODE=$?
+check "a new .p12 replaces the installed one" '[ $CODE -eq 0 ] && key_is p12:pw'
 
 [ "$FAILS" -eq 0 ] || exit 1
 echo "PASS: runner install refuses bad input before changing anything"

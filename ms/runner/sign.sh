@@ -83,7 +83,7 @@ for path in "$@"; do
     || refuse "rcodesign could not sign $path"
   # Apple's notary service takes no bare Mach-O, only a zip of one.
   ditto -c -k --norsrc --noextattr --noqtn --noacl "$copy" "$copy.zip"
-  rcodesign notary-submit --api-key-file "$KEY_DIR/notary-api-key.json" --wait "$copy.zip" \
+  rcodesign notary-submit --api-key-file "$KEY_DIR/notary-api-key.json" --wait --max-wait-seconds 1500 "$copy.zip" \
     || refuse "Apple did not notarize $path"
 done
 

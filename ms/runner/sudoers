@@ -1,4 +1,7 @@
 # /etc/sudoers.d/herdr-signer, installed by ms/runner/install.sh. Release jobs
 # run as herdr-signer and sign through this one root-owned helper; the signing
 # key is readable only by root.
+# A program an admin runs as herdr-signer (install.sh does) gets its own terminal,
+# so it cannot type into the admin's.
+Defaults>herdr-signer use_pty
 herdr-signer ALL=(root) NOPASSWD: /usr/local/herdr-signer/sign.sh

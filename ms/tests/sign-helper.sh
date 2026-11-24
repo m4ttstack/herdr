@@ -82,8 +82,13 @@ case "$SIGNED_PATH" in
   "$WORK"/*|"$(cd "$WORK" && pwd -P)"/*|"") bad "signs a copy outside _work, not the file itself (signed $SIGNED_PATH)" ;;
   *) ok "signs a copy outside _work, not the file itself" ;;
 esac
-grep -q -- "notary-submit --config-file /dev/null --api-key-file $KEYS/notary-api-key.json --wait " "$LOG" && ok "notarizes with the root-only API key and waits" || bad "notarizes with the root-only API key and waits"
+grep -q -- "notary-submit --config-file /dev/null --api-key-file $KEYS/notary-api-key.json --wait --max-wait-seconds " "$LOG" && ok "notarizes with the root-only API key and waits" || bad "notarizes with the root-only API key and waits"
 grep -qx notarized "$LOG" && ok "notarizes the signed file" || bad "notarizes the signed file"
+
+# Apple can take longer than rcodesign's default 10 minutes.
+grep -q -- "--wait --max-wait-seconds 1500 " "$LOG" && ok "waits 25 minutes for Apple" || bad "waits 25 minutes for Apple"
+# As root, every read and write of a caller's path goes through the caller.
+grep -qxF '  as_caller() { sudo -u "$CALLER" -- "$@"; }' "$HELPER" && ok "as root, touches the caller's files as the caller" || bad "as root, touches the caller's files as the caller"
 
 # Two files in one call.
 BIN2="$WORK/herdr/herdr/dist/herdr-macos-x86_64"
