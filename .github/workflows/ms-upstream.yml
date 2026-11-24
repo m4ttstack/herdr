@@ -62,8 +62,7 @@ jobs:
     if: needs.find.outputs.action == 'rebase'
     runs-on: macos-latest
     timeout-minutes: 120
-    permissions:
-      contents: read
+    permissions: {}
     outputs:
       code: ${{ steps.rebase.outputs.code }}
       tree: ${{ steps.rebase.outputs.tree }}
@@ -71,10 +70,10 @@ jobs:
       failed: ${{ steps.test.outputs.failed }}
       test_outcome: ${{ steps.test.outcome }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          fetch-depth: 0
-          persist-credentials: false
+      # Not actions/checkout: its post step gets the job token, after upstream code
+      # could have rewritten it.
+      - name: Clone
+        run: git clone -q "https://github.com/$REPO.git" .
 
       - name: Rebase onto the new release
         id: rebase
@@ -106,6 +105,7 @@ jobs:
         if: steps.rebase.outputs.code == '0'
         with:
           version: 0.16.0
+          use-cache: false
 
       - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         if: steps.rebase.outputs.code == '0'
