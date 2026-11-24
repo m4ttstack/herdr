@@ -140,11 +140,7 @@ fn run_channel_command(args: &[String]) -> std::io::Result<i32> {
     match args.first().map(|arg| arg.as_str()) {
         Some("set") => channel_set(&args[1..]),
         Some("show") if args.len() == 1 => {
-            let config = crate::config::Config::load().config;
-            println!(
-                "{}",
-                shown_channel(crate::build_info::is_fork(), config.update.channel.as_str())
-            );
+            println!("{}", current_channel());
             Ok(0)
         }
         Some("help" | "--help" | "-h") => {
@@ -240,6 +236,11 @@ fn parse_channel_set_arg(args: &[String]) -> Option<&str> {
     } else {
         None
     }
+}
+
+fn current_channel() -> &'static str {
+    let config = crate::config::Config::load().config;
+    shown_channel(crate::build_info::is_fork(), config.update.channel.as_str())
 }
 
 /// The fork has one channel, its own releases, whatever the config file says.
