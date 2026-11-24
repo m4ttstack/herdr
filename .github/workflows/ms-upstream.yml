@@ -56,7 +56,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
   # Runs upstream's build and test code, so no token reaches those steps:
-  # credentials stay out of .git/config and only the push and issue steps get one.
+  # credentials stay out of .git/config and only the push step gets one.
   candidate:
     needs: find
     if: needs.find.outputs.action == 'rebase'
@@ -64,34 +64,47 @@ jobs:
     timeout-minutes: 120
     permissions:
       contents: write
-      issues: write
+    outputs:
+      code: ${{ steps.rebase.outputs.code }}
+      detail: ${{ steps.rebase.outputs.detail }}
+      failed: ${{ steps.test.outputs.failed }}
+      test_outcome: ${{ steps.test.outcome }}
+      pushed: ${{ steps.push.outputs.pushed }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
           persist-credentials: false
 
       - name: Rebase onto the new release
         id: rebase
+        env:
+          SOURCE: ${{ needs.find.outputs.source }}
+          CURRENT: ${{ needs.find.outputs.current }}
+          NEWEST: ${{ needs.find.outputs.newest }}
         run: |
-          set -uo pipefail
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
-          git fetch -q --no-tags "$UPSTREAM" "refs/tags/v${{ needs.find.outputs.current }}:refs/tags/v${{ needs.find.outputs.current }}" \
-            "refs/tags/v${{ needs.find.outputs.newest }}:refs/tags/v${{ needs.find.outputs.newest }}"
-          git switch -q "${{ needs.find.outputs.source }}"
-          ms/rebase-onto.sh "v${{ needs.find.outputs.newest }}" 2> rebase.err
-          code=$?
+          git fetch -q --no-tags "$UPSTREAM" "refs/tags/v$CURRENT:refs/tags/v$CURRENT" "refs/tags/v$NEWEST:refs/tags/v$NEWEST"
+          git switch -q "$SOURCE"
+          code=0
+          ms/rebase-onto.sh "v$NEWEST" 2> rebase.err || code=$?
           cat rebase.err >&2
-          echo "code=$code" >> "$GITHUB_OUTPUT"
-          { echo "detail<<EOF"; cat rebase.err; echo "EOF"; } >> "$GITHUB_OUTPUT"
+          delimiter="ms-upstream-$(openssl rand -hex 16)"
+          {
+            echo "code=$code"
+            echo "detail<<$delimiter"
+            cat rebase.err
+            echo "$delimiter"
+          } >> "$GITHUB_OUTPUT"
 
-      - uses: mlugg/setup-zig@v2
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         if: steps.rebase.outputs.code == '0'
         with:
           version: 0.16.0
 
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         if: steps.rebase.outputs.code == '0'
         with:
           tool: nextest
@@ -118,80 +131,41 @@ jobs:
           # change .github/workflows. MS_PUSH_TOKEN: a fine-grained token for
           # m4ttstack/herdr only, with Contents and Workflows write.
           PUSH_TOKEN: ${{ secrets.MS_PUSH_TOKEN || github.token }}
+          NEWEST: ${{ needs.find.outputs.newest }}
         run: |
           set -uo pipefail
-          if git push -q "https://x-access-token:${PUSH_TOKEN}@github.com/$REPO.git" "mattstack/${{ needs.find.outputs.newest }}" 2> push.err; then
+          if git push -q "https://x-access-token:${PUSH_TOKEN}@github.com/$REPO.git" "mattstack/$NEWEST" 2> push.err; then
             echo "pushed=yes" >> "$GITHUB_OUTPUT"
           else
             cat push.err >&2
             echo "pushed=no" >> "$GITHUB_OUTPUT"
           fi
 
+  # On a fresh machine from the fork's own branch: the candidate job's machine
+  # ran upstream's build code, which could have changed any file or tool there.
+  report:
+    needs: [find, candidate]
+    if: always() && needs.find.outputs.action == 'rebase'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.find.outputs.source }}
+          persist-credentials: false
+
       - name: Open or update the issue
-        if: always()
         env:
           GH_TOKEN: ${{ github.token }}
           CURRENT: ${{ needs.find.outputs.current }}
           NEWEST: ${{ needs.find.outputs.newest }}
-          REBASE_CODE: ${{ steps.rebase.outputs.code }}
-          REBASE_DETAIL: ${{ steps.rebase.outputs.detail }}
-          FAILED: ${{ steps.test.outputs.failed }}
-          TEST_OUTCOME: ${{ steps.test.outcome }}
-          PUSHED: ${{ steps.push.outputs.pushed }}
+          REBASE_CODE: ${{ needs.candidate.outputs.code }}
+          REBASE_DETAIL: ${{ needs.candidate.outputs.detail }}
+          FAILED: ${{ needs.candidate.outputs.failed }}
+          TEST_OUTCOME: ${{ needs.candidate.outputs.test_outcome }}
+          PUSHED: ${{ needs.candidate.outputs.pushed }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          set -euo pipefail
-          T='`'
-          F='```'
-          if [ "$REBASE_CODE" = "0" ] && [ "$TEST_OUTCOME" != "success" ]; then
-            FAILED="${FAILED:-the test setup (see the run)}"
-          fi
-          compare="https://github.com/herdrdev/herdr/compare/v$CURRENT...v$NEWEST"
-          publish="gh workflow run ms-release.yml -R $REPO -f branch=mattstack/$NEWEST"
-          released="Upstream released [herdr $NEWEST]($compare)."
-          if [ "$PUSHED" = "yes" ]; then
-            title="herdr $NEWEST ready to publish"
-            body="$released The fork commits rebased onto it cleanly and every test passed, so ${T}mattstack/$NEWEST${T} is pushed.
-
-          To publish it:
-
-          ${F}bash
-          $publish
-          ${F}"
-          elif [ "$REBASE_CODE" = "0" ] && [ -z "$FAILED" ]; then
-            title="herdr $NEWEST ready to publish"
-            body="$released The fork commits rebased onto it cleanly and every test passed, but this job could not push the branch: its token cannot push upstream workflow changes (an ${T}MS_PUSH_TOKEN${T} secret, a fine-grained token for this repo with Contents and Workflows write, fixes that). Push it from a clone, then publish:
-
-          ${F}bash
-          git fetch --no-tags $UPSTREAM refs/tags/v$CURRENT:refs/tags/v$CURRENT refs/tags/v$NEWEST:refs/tags/v$NEWEST
-          git switch mattstack/$CURRENT && ms/rebase-onto.sh v$NEWEST && git push -u origin mattstack/$NEWEST
-          $publish
-          ${F}"
-          elif [ "$REBASE_CODE" = "3" ]; then
-            title="herdr $NEWEST needs a hand"
-            body="$released Rebasing the fork commits onto it conflicts:
-
-          ${F}
-          $REBASE_DETAIL
-          ${F}"
-          elif [ "$REBASE_CODE" = "0" ]; then
-            title="herdr $NEWEST needs a hand"
-            body="$released The fork commits rebased onto it cleanly, but these tests failed: $FAILED."
-          else
-            title="herdr $NEWEST needs a hand"
-            body="$released The rebase stopped before it started:
-
-          ${F}
-          $REBASE_DETAIL
-          ${F}"
-          fi
-          body="$body
-
-          [Run]($RUN_URL)"
-          existing="$(gh issue list -R "$REPO" --state open --search "in:title \"herdr $NEWEST\"" --json number,title \
-            --jq "map(select(.title == \"$title\")) | .[0].number // empty")"
-          if [ -n "$existing" ]; then
-            gh issue comment "$existing" -R "$REPO" --body "$body"
-          else
-            gh issue create -R "$REPO" --title "$title" --body "$body"
-          fi
+        run: ms/upstream-issue.sh
