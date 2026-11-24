@@ -82,14 +82,12 @@ jobs:
           # and Apple's timestamp, then notarizes (ms/runner/README.md).
           sudo -n /usr/local/herdr-signer/sign.sh "$PWD/dist/herdr-macos-aarch64" "$PWD/dist/herdr-macos-x86_64"
 
-      - name: Verify signatures, architectures and version
+      - name: Verify signatures, notarization, architectures and version
         run: |
           set -euo pipefail
           for pair in herdr-macos-aarch64:arm64 herdr-macos-x86_64:x86_64; do
             asset="${pair%%:*}"; arch="${pair#*:}"
-            codesign --verify --strict "dist/$asset"
-            got="$(lipo -archs "dist/$asset")"
-            [ "$got" = "$arch" ] || { echo "::error::$asset is $got, expected $arch"; exit 1; }
+            ms/verify-release.sh "dist/$asset" "$arch"
           done
           case "$(uname -m)" in
             arm64) native=herdr-macos-aarch64 ;;
