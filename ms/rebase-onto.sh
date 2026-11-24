@@ -25,6 +25,11 @@ fi
 
 START="$(git symbolic-ref --quiet --short HEAD || git rev-parse HEAD)"
 
+in_rebase() {
+  [ -d "$(git rev-parse --git-path rebase-merge)" ] || [ -d "$(git rev-parse --git-path rebase-apply)" ]
+}
+if in_rebase; then echo "ms/rebase-onto.sh: a rebase is already in progress" >&2; exit 2; fi
+
 LOG="$(mktemp)"
 DONE=""
 on_exit() {
@@ -36,10 +41,6 @@ on_exit() {
   case "$code" in 3|4) exit "$code" ;; *) exit 4 ;; esac
 }
 trap on_exit EXIT
-
-in_rebase() {
-  [ -d "$(git rev-parse --git-path rebase-merge)" ] || [ -d "$(git rev-parse --git-path rebase-apply)" ]
-}
 
 # Undoes the rebase even when --abort fails, and returns to the start branch.
 clean_up() {
