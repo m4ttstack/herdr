@@ -1,8 +1,8 @@
 #!/bin/bash
 # Reports one ms-upstream.yml night on the issue for that upstream version. One
 # issue per version, found by the ms-upstream label and the marker in its body:
-# opened the first night, edited and commented when the outcome changes, left
-# alone when a night repeats the last outcome.
+# opened the first night, edited and commented (and reopened if closed) when the
+# outcome changes, left alone when a night repeats the last outcome.
 # Reads REPO UPSTREAM CURRENT NEWEST RUN_URL REBASE_CODE REBASE_DETAIL FAILED
 # TEST_OUTCOME PUSHED from the environment; needs GH_TOKEN with issues: write.
 set -euo pipefail
@@ -27,7 +27,7 @@ To publish it:
 ${F}bash
 $publish
 ${F}"
-elif [ "$REBASE_CODE" = "0" ] && [ -z "$FAILED" ]; then
+elif [ "$REBASE_CODE" = "0" ] && [ -z "$FAILED" ] && [ "$PUSHED" = "no" ]; then
   state=unpushed
   title="herdr $NEWEST ready to publish"
   body="$released The fork commits rebased onto it cleanly and every test passed, but the nightly could not push the branch. Usually its token cannot push upstream workflow changes (an ${T}MS_PUSH_TOKEN${T} secret, a fine-grained token for this repo with Contents and Workflows write, fixes that). Push it from a clone, then publish:
@@ -37,6 +37,10 @@ git fetch --no-tags $UPSTREAM refs/tags/v$CURRENT:refs/tags/v$CURRENT refs/tags/
 git switch mattstack/$CURRENT && ms/rebase-onto.sh v$NEWEST && git push -u origin mattstack/$NEWEST
 $publish
 ${F}"
+elif [ "$REBASE_CODE" = "0" ] && [ -z "$FAILED" ]; then
+  state=pushfailed
+  title="herdr $NEWEST needs a hand"
+  body="$released The fork commits rebased onto it cleanly and every test passed, but the push job failed before it pushed anything; see the run."
 elif [ "$REBASE_CODE" = "3" ]; then
   state=conflict
   title="herdr $NEWEST needs a hand"
@@ -69,17 +73,18 @@ body="$body
 
 $marker$state -->"
 
-existing="$(gh issue list -R "$REPO" --label "$LABEL" --state open --limit 100 --json number,body \
-  | jq -r --arg m "$marker" 'map(select(.body | contains($m))) | .[0] // empty | "\(.number) \(.body | split($m)[1] | split(" -->")[0])"')"
+existing="$(gh issue list -R "$REPO" --label "$LABEL" --state all --limit 100 --json number,body,state \
+  | jq -r --arg m "$marker" 'map(select(.body | contains($m))) | (map(select(.state == "OPEN")) + .) | .[0] // empty | "\(.number) \(.state) \(.body | split($m)[1] | split(" -->")[0])"')"
 if [ -z "$existing" ]; then
   gh label create "$LABEL" -R "$REPO" --force --color 5319e7 --description "ms-upstream.yml's report on an upstream release"
   gh issue create -R "$REPO" --label "$LABEL" --title "$title" --body "$body"
   exit 0
 fi
-number="${existing%% *}"
-if [ "${existing#* }" = "$state" ]; then
+read -r number open last <<<"$existing"
+if [ "$last" = "$state" ]; then
   echo "Issue #$number already reports $state."
   exit 0
 fi
+[ "$open" = OPEN ] || gh issue reopen "$number" -R "$REPO"
 gh issue edit "$number" -R "$REPO" --title "$title" --body "$body"
 gh issue comment "$number" -R "$REPO" --body "$body"
