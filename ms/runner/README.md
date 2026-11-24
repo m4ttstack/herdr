@@ -134,10 +134,10 @@ The first lists `herdr-signer-<host> online`. The second shows `sign.sh`,
 `notary-api-key.json`, each `-rw------- root wheel`. The third lists only
 `(root) NOPASSWD: /usr/local/herdr-signer/sign.sh`.
 
-rcodesign reads only the legacy `.p12` format. If a release fails to sign with
+rcodesign reads only the legacy `.p12` format. If the install refuses it with
 "incorrect password given when decrypting PFX data", convert the export and
 install again with the converted file:
-`openssl pkcs12 -in developer-id.p12 -nodes | openssl pkcs12 -export -legacy -out developer-id-legacy.p12`.
+`(umask 077; /usr/bin/openssl pkcs12 -in developer-id.p12 -nodes -out key.pem && /usr/bin/openssl pkcs12 -export -in key.pem -out developer-id-legacy.p12; rm -f key.pem)`.
 
 ## Publish
 

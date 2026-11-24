@@ -119,7 +119,10 @@ printf p12 > "$TMP/new.p12"
 reset_keys; mkdir -p "$KEYS"; printf kept > "$KEYS/developer-id.p12"; printf keptpw > "$KEYS/p12-password"
 keys $'wrong\n' "$TMP/new.p12"; CODE=$?
 check "a mistyped .p12 password changes nothing" '[ $CODE -ne 0 ] && key_is kept:keptpw && [ -e "$OLD" ] && [ -z "$(ls "$KEYS" | grep new)" ]'
-check "a refused .p12 says why and how to convert it" 'grep -q "incorrect password given" "$TMP/keys.out" && grep -q -- "-legacy" "$TMP/keys.out"'
+# macOS's own openssl: it writes the form rcodesign reads and has no -legacy flag.
+# Through a file: piping the .p12's parts fails when the certificate comes first.
+CONVERT='(umask 077; /usr/bin/openssl pkcs12 -in developer-id.p12 -nodes -out key.pem && /usr/bin/openssl pkcs12 -export -in key.pem -out developer-id-legacy.p12; rm -f key.pem)'
+check "a refused .p12 says why and how to convert it" 'grep -q "incorrect password given" "$TMP/keys.out" && grep -qF "$CONVERT" "$TMP/keys.out" && grep -qF "$CONVERT" "$ROOT/ms/runner/README.md"'
 keys $'pw\n' "$TMP/new.p12"; CODE=$?
 check "a new .p12 replaces the installed one" '[ $CODE -eq 0 ] && key_is p12:pw'
 

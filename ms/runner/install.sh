@@ -176,7 +176,7 @@ if [ -n "$STAGED" ]; then
     sudo rm -rf "$PROBE"
     sudo rm -f "$KEY_DIR/developer-id.p12.new" "$KEY_DIR/p12-password.new"
     echo "rcodesign cannot sign with that .p12 and password; the runner's key is unchanged." >&2
-    echo "With the right password, convert the .p12 and install again: openssl pkcs12 -in developer-id.p12 -nodes | openssl pkcs12 -export -legacy -out developer-id-legacy.p12" >&2
+    echo "With the right password, convert the .p12 and install again: (umask 077; /usr/bin/openssl pkcs12 -in developer-id.p12 -nodes -out key.pem && /usr/bin/openssl pkcs12 -export -in key.pem -out developer-id-legacy.p12; rm -f key.pem)" >&2
     exit 1
   fi
   sudo rm -rf "$PROBE"
