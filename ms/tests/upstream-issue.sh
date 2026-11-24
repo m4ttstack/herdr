@@ -78,5 +78,11 @@ night '[]' REBASE_CODE=4 "REBASE_DETAIL=rebase failed onto v0.9.6: boom"
 has "another rebase failure is marked as stopped" "state=stopped"
 has "another rebase failure quotes git" "rebase failed onto v0.9.6: boom"
 
+# A candidate job that died before the rebase reported nothing.
+night '[]'
+has "a candidate with no rebase result is marked incomplete" "state=incomplete"
+has "a candidate with no rebase result needs a hand" "[herdr 0.9.6 needs a hand]"
+lacks "a candidate with no rebase result is not called a rebase failure" "The rebase failed"
+
 [ "$FAILS" -eq 0 ] || { echo "upstream-issue: $FAILS check(s) failed" >&2; exit 1; }
 echo "PASS: one issue per upstream version, updated only when the outcome changes"

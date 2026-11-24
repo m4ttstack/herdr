@@ -30,7 +30,7 @@ ${F}"
 elif [ "$REBASE_CODE" = "0" ] && [ -z "$FAILED" ]; then
   state=unpushed
   title="herdr $NEWEST ready to publish"
-  body="$released The fork commits rebased onto it cleanly and every test passed, but this job could not push the branch: its token cannot push upstream workflow changes (an ${T}MS_PUSH_TOKEN${T} secret, a fine-grained token for this repo with Contents and Workflows write, fixes that). Push it from a clone, then publish:
+  body="$released The fork commits rebased onto it cleanly and every test passed, but the nightly could not push the branch. Usually its token cannot push upstream workflow changes (an ${T}MS_PUSH_TOKEN${T} secret, a fine-grained token for this repo with Contents and Workflows write, fixes that). Push it from a clone, then publish:
 
 ${F}bash
 git fetch --no-tags $UPSTREAM refs/tags/v$CURRENT:refs/tags/v$CURRENT refs/tags/v$NEWEST:refs/tags/v$NEWEST
@@ -49,6 +49,10 @@ elif [ "$REBASE_CODE" = "0" ]; then
   state=tests
   title="herdr $NEWEST needs a hand"
   body="$released The fork commits rebased onto it cleanly, but these tests failed: $FAILED."
+elif [ -z "$REBASE_CODE" ]; then
+  state=incomplete
+  title="herdr $NEWEST needs a hand"
+  body="$released The nightly stopped before it could report on the rebase; see the run."
 else
   state=stopped
   title="herdr $NEWEST needs a hand"
