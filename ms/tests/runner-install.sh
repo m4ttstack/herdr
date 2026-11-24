@@ -40,5 +40,27 @@ UNSET="$(ruby -e '
 ' "$ROOT/ms/runner/install.sh")"
 if [ -z "$UNSET" ]; then echo "ok   every variable the installer reads is assigned"; else echo "FAIL every variable the installer reads is assigned (not assigned: $UNSET)" >&2; FAILS=1; fi
 
+# Migration: build code could have swapped the old key files for links, so they
+# are read as that user and never moved into the root-only directory.
+BLOCK="$(sed -n '/^elif sudo test -f "\$OLD_SIGNING_DIR/,/^fi$/p' "$ROOT/ms/runner/install.sh" | sed -e '1s/^elif/if/')"
+OLD="$TMP/old"; KEYS="$TMP/keys"; mkdir -p "$OLD" "$KEYS"
+printf 'secret' > "$TMP/root-file"; chmod 400 "$TMP/root-file"
+printf 'p12' > "$OLD/developer-id.p12"; ln -s "$TMP/root-file" "$OLD/p12-password"
+migrate() { # runs the block with sudo as a plain runner; "sudo -u" refuses $TMP/root-file, as that user's reads would be
+  (set -euo pipefail
+   OLD_SIGNING_DIR="$OLD" KEY_DIR="$KEYS" CI_USER=herdr-signer
+   sudo() {
+     if [ "$1" = -u ]; then shift 2; case "$(readlink "${!#}" 2>/dev/null)" in "$TMP/root-file") return 1 ;; esac; fi
+     "$@"
+   }
+   eval "$BLOCK") >/dev/null 2>&1
+}
+migrate
+if [ -z "$(ls "$KEYS" | grep -v '\.new$')" ] && [ -e "$OLD/developer-id.p12" ]; then echo "ok   a linked old key file is not migrated"; else echo "FAIL a linked old key file is not migrated (key dir: $(ls "$KEYS" | tr '\n' ' '))" >&2; FAILS=1; fi
+rm -f "$OLD/p12-password" "$KEYS"/*; printf 'pw' > "$OLD/p12-password"
+migrate
+if [ "$(cat "$KEYS/developer-id.p12" "$KEYS/p12-password" 2>/dev/null)" = p12pw ] && [ "$(ls "$KEYS" | wc -l | tr -d ' ')" = 2 ]; then echo "ok   the old key files are migrated"; else echo "FAIL the old key files are migrated (key dir: $(ls "$KEYS" | tr '\n' ' '))" >&2; FAILS=1; fi
+if [ "$(stat -f %Lp "$KEYS/developer-id.p12" 2>/dev/null)" = 600 ]; then echo "ok   a migrated key file is mode 600"; else echo "FAIL a migrated key file is mode 600" >&2; FAILS=1; fi
+
 [ "$FAILS" -eq 0 ] || exit 1
 echo "PASS: runner install refuses bad input before changing anything"
