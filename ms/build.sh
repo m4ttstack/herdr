@@ -9,11 +9,18 @@ ARCH=""
 REVISION=""
 OUT=""
 
+value() { # value <flag> <next arg>: the flag's value, or a refusal naming the flag
+  case "${2:-}" in
+    ''|--*) echo "ms/build.sh: $1 needs a value" >&2; exit 2 ;;
+  esac
+  printf '%s' "$2"
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
-    --arch) ARCH="${2:-}"; shift 2 ;;
-    --revision) REVISION="${2:-}"; shift 2 ;;
-    --out) OUT="${2:-}"; shift 2 ;;
+    --arch) ARCH="$(value "$1" "${2:-}")"; shift 2 ;;
+    --revision) REVISION="$(value "$1" "${2:-}")"; shift 2 ;;
+    --out) OUT="$(value "$1" "${2:-}")"; shift 2 ;;
     -h|--help)
       echo "usage: ms/build.sh --arch arm64|x86_64 --revision N --out DIR"
       echo "  writes DIR/herdr-macos-<aarch64|x86_64>, reporting <base>-ms.<N>"
